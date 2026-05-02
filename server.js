@@ -37,6 +37,7 @@ app.post('/upload', upload.single('audio'), (req, res) => {
 
   state.audioFile = req.file.path;
   state.audioFileName = req.file.originalname;
+  state.audioFileUrl = '/uploads/' + req.file.filename;
   state.isPlaying = false;
   state.startServerTime = null;
 
@@ -44,10 +45,10 @@ app.post('/upload', upload.single('audio'), (req, res) => {
   broadcast({
     type: 'file_loaded',
     fileName: state.audioFileName,
-    fileUrl: '/' + req.file.path,
+    fileUrl: state.audioFileUrl,
   });
 
-  res.json({ success: true, fileName: state.audioFileName, fileUrl: '/' + req.file.path });
+  res.json({ success: true, fileName: state.audioFileName, fileUrl: state.audioFileUrl });
 });
 
 // WebSocket
@@ -64,7 +65,7 @@ wss.on('connection', (ws) => {
     clientCount: clients.size,
     audioFile: state.audioFile ? {
       fileName: state.audioFileName,
-      fileUrl: '/uploads/' + path.basename(state.audioFile),
+      fileUrl: state.audioFileUrl,
     } : null,
     isPlaying: state.isPlaying,
     startServerTime: state.startServerTime,
