@@ -593,9 +593,19 @@
 
     <!-- LISTENER VIEW -->
     <div id="listenerView" class="hidden">
-      <div style="text-align:center; padding: 20px 0; color: var(--muted); font-size:14px;" id="listenerStatus">
-        Waiting for host to load a file...
+
+      <!-- Step 1: Activate audio (required by mobile browsers) -->
+      <div id="activateAudioBox" style="text-align:center; padding: 16px 0;">
+        <div style="font-size:13px; color:var(--muted); margin-bottom:14px;">Tap the button below to activate audio on this device.<br><span style="font-size:11px;">Required once by mobile browsers.</span></div>
+        <button class="btn btn-accent" style="width:100%; padding:16px; font-size:15px;" onclick="activateAudio()">🎧 Activate Audio</button>
       </div>
+
+      <!-- Step 2: After activation -->
+      <div id="listenerReady" class="hidden">
+        <div style="text-align:center; padding: 8px 0; color: var(--accent); font-size:13px; margin-bottom:8px;">✅ Audio activated!</div>
+        <div style="text-align:center; font-size:13px; color:var(--muted);" id="listenerStatus">Waiting for host to load a file...</div>
+      </div>
+
     </div>
   </div>
 
@@ -818,12 +828,8 @@ async function onFileLoaded(fileName, fileUrl) {
   document.getElementById('fileInfo').classList.remove('hidden');
   document.getElementById('uploadZone').style.display = 'none';
 
-  // Listener view
-  document.getElementById('listenerStatus').innerHTML = `
-    <div style="color: var(--accent); font-size:13px; margin-bottom:8px;">🎵 File ready</div>
-    <div style="font-size:12px;">${fileName}</div>
-    <div style="font-size:11px; color: var(--muted); margin-top:4px;">Waiting for host to press play...</div>
-  `;
+  // Listener view — update if already activated
+  updateListenerStatus();
 
   // Load audio
   showToast('Loading audio...');
@@ -1062,6 +1068,34 @@ document.addEventListener('click', (e) => {
     navigator.clipboard.writeText(location.href).then(() => showToast('URL copied!'));
   }
 });
+
+// ============================================
+// AUDIO ACTIVATION (mobile browser unlock)
+// ============================================
+let audioActivated = false;
+
+function activateAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  audioCtx.resume().then(() => {
+    audioActivated = true;
+    document.getElementById('activateAudioBox').classList.add('hidden');
+    document.getElementById('listenerReady').classList.remove('hidden');
+    showToast('Audio ready!');
+    if (currentFileUrl) updateListenerStatus();
+  });
+}
+
+function updateListenerStatus() {
+  const el = document.getElementById('listenerStatus');
+  if (!el) return;
+  if (currentFileUrl) {
+    el.innerHTML = `<div style="color:var(--accent); margin-bottom:4px;">🎵 File loaded</div><div style="font-size:11px; color:var(--muted);">Waiting for host to press play...</div>`;
+  } else {
+    el.textContent = 'Waiting for host to load a file...';
+  }
+}
 
 // ============================================
 // INIT
