@@ -828,17 +828,18 @@ async function onFileLoaded(fileName, fileUrl) {
   document.getElementById('fileInfo').classList.remove('hidden');
   document.getElementById('uploadZone').style.display = 'none';
 
-  // Listener view — update if already activated
-  updateListenerStatus();
+  // Listener view
+  updateListenerStatus('loading');
 
   // Load audio
-  showToast('Loading audio...');
   try {
     await loadAudio(fileUrl);
     document.getElementById('hostPlayer').classList.add('visible');
-    showToast('Ready!');
+    updateListenerStatus('ready');
+    showToast('Audio ready!');
   } catch (e) {
-    showToast('Error loading audio');
+    updateListenerStatus('error');
+    showToast('Error loading audio: ' + e.message);
     console.error(e);
   }
 }
@@ -1087,10 +1088,16 @@ function activateAudio() {
   });
 }
 
-function updateListenerStatus() {
+function updateListenerStatus(state) {
   const el = document.getElementById('listenerStatus');
   if (!el) return;
-  if (currentFileUrl) {
+  if (state === 'loading') {
+    el.innerHTML = `<span class="spinner"></span> Loading audio file...`;
+  } else if (state === 'ready') {
+    el.innerHTML = `<div style="color:var(--accent); margin-bottom:4px;">🎵 File loaded & ready</div><div style="font-size:11px; color:var(--muted);">Waiting for host to press play...</div>`;
+  } else if (state === 'error') {
+    el.innerHTML = `<div style="color:var(--danger);">❌ Failed to load audio.<br><span style="font-size:11px;">Try refreshing the page.</span></div>`;
+  } else if (currentFileUrl) {
     el.innerHTML = `<div style="color:var(--accent); margin-bottom:4px;">🎵 File loaded</div><div style="font-size:11px; color:var(--muted);">Waiting for host to press play...</div>`;
   } else {
     el.textContent = 'Waiting for host to load a file...';
