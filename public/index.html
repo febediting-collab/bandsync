@@ -626,8 +626,16 @@
     </div>
   </div>
 
-  <!-- Connected Devices Card -->
-  <div class="card">
+  <!-- DEBUG PANEL -->
+  <div class="card" id="debugCard">
+    <div class="card-title" style="display:flex; justify-content:space-between;">
+      <span>Debug Log</span>
+      <span onclick="document.getElementById('debugLog').innerHTML=''" style="cursor:pointer; color:var(--muted); font-size:10px;">CLEAR</span>
+    </div>
+    <div id="debugLog" style="font-family: monospace; font-size:11px; color: #aaa; max-height: 200px; overflow-y: auto; line-height:1.8;"></div>
+  </div>
+
+
     <div class="card-title">Connected Devices</div>
     <div class="client-list" id="clientList">
       <div style="color:var(--muted); font-size:13px; text-align:center; padding:8px;">No devices yet</div>
@@ -849,21 +857,22 @@ async function onFileLoaded(fileName, fileUrl) {
 }
 
 async function loadAudio(url) {
-  // Fetch audio data first (no AudioContext needed yet)
+  dbg('Fetching: ' + url, '#0088ff');
   const res = await fetch(url);
   if (!res.ok) throw new Error('HTTP ' + res.status);
+  dbg('Fetch OK, decoding...', '#0088ff');
   const arrayBuffer = await res.arrayBuffer();
+  dbg('ArrayBuffer size: ' + (arrayBuffer.byteLength/1024).toFixed(0) + 'KB', '#0088ff');
 
-  // Create AudioContext if needed
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   }
-
-  // iOS REQUIRES resume() before decodeAudioData works
   await audioCtx.resume();
+  dbg('AudioCtx state before decode: ' + audioCtx.state, '#0088ff');
 
   audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
   audioDuration = audioBuffer.duration;
+  dbg('Decode OK! Duration: ' + audioDuration.toFixed(1) + 's', '#00ff88');
 
   document.getElementById('totalTime').textContent = formatTime(audioDuration);
 }
@@ -872,45 +881,43 @@ async function loadAudio(url) {
 // PLAYBACK
 // ============================================
 function schedulePlay(playAtServerTime, startOffset) {
-  if (!audioBuffer || !audioCtx) return;
+  dbg('schedulePlay called. audioBuffer=' + !!audioBuffer + ' audioCtx=' + !!audioCtx, '#ffaa00');
+  if (!audioBuffer || !audioCtx) {
+    dbg('ABORT: missing audioBuffer or audioCtx!', '#ff4444');
+    return;
+  }
 
-  // Resume AudioContext (required by browsers after user gesture)
   audioCtx.resume();
+  dbg('AudioCtx state: ' + audioCtx.state, '#ffaa00');
 
-  // Stop existing
   if (audioSource) {
     try { audioSource.stop(); } catch(e) {}
     audioSource = null;
   }
 
-  // Convert server time to local audioCtx time
-  const nowLocal = Date.now();
   const nowServer = serverTimeNow();
   const msUntilPlay = playAtServerTime - nowServer;
   const audioCtxPlayAt = audioCtx.currentTime + Math.max(0, msUntilPlay / 1000);
+
+  dbg('msUntilPlay: ' + msUntilPlay.toFixed(0) + 'ms, playAt audioCtx: ' + audioCtxPlayAt.toFixed(2), '#ffaa00');
 
   audioSource = audioCtx.createBufferSource();
   audioSource.buffer = audioBuffer;
   audioSource.connect(audioCtx.destination);
   audioSource.start(audioCtxPlayAt, startOffset);
 
+  dbg('audioSource.start() called!', '#00ff88');
+
   playbackStartAudioCtxTime = audioCtxPlayAt - startOffset;
   playbackStartOffset = startOffset;
-
   isPlaying = true;
 
-  // Show countdown if > 0.5s away
-  if (msUntilPlay > 500) {
-    showCountdown(msUntilPlay);
-  }
-
-  // Update play button
+  if (msUntilPlay > 500) showCountdown(msUntilPlay);
   updatePlayBtn(true);
-
-  // Start progress
   startProgressUpdate();
 
   audioSource.onended = () => {
+    dbg('Audio ended', '#aaa');
     isPlaying = false;
     updatePlayBtn(false);
     stopProgressUpdate();
@@ -1082,34 +1089,57 @@ document.addEventListener('click', (e) => {
 });
 
 // ============================================
+// DEBUG LOGGER
+// ============================================
+function dbg(msg, color) {
+  console.log(msg);
+  const log = document.getElementById('debugLog');
+  if (!log) return;
+  const line = document.createElement('div');
+  line.style.color = color || '#aaa';
+  const time = new Date().toLocaleTimeString('en', {hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  line.textContent = time + ' ' + msg;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+// ============================================
 // AUDIO ACTIVATION (mobile browser unlock)
 // ============================================
 let audioActivated = false;
 
 function activateAudio() {
+  dbg('Activate tapped', '#0088ff');
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    dbg('AudioCtx created, state: ' + audioCtx.state, '#0088ff');
   }
   audioCtx.resume().then(async () => {
+    dbg('AudioCtx resumed, state: ' + audioCtx.state, '#00ff88');
     audioActivated = true;
     document.getElementById('activateAudioBox').classList.add('hidden');
     document.getElementById('listenerReady').classList.remove('hidden');
 
-    // If file already loaded by server but audio buffer not ready yet — load now
     if (currentFileUrl && !audioBuffer) {
+      dbg('File URL exists, loading now: ' + currentFileUrl, '#ffaa00');
       updateListenerStatus('loading');
       try {
         await loadAudio(currentFileUrl);
         updateListenerStatus('ready');
         showToast('Audio ready!');
+        dbg('Audio loaded! Duration: ' + audioDuration.toFixed(1) + 's', '#00ff88');
       } catch (e) {
         updateListenerStatus('error');
+        dbg('LOAD ERROR: ' + e.message, '#ff4444');
         showToast('Error: ' + e.message);
       }
     } else {
+      dbg('No file URL yet, waiting for host', '#ffaa00');
       showToast('Audio ready!');
       if (currentFileUrl) updateListenerStatus('ready');
     }
+  }).catch(e => {
+    dbg('Resume FAILED: ' + e.message, '#ff4444');
   });
 }
 
