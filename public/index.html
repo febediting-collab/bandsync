@@ -823,15 +823,19 @@ async function uploadFile(input) {
 async function onFileLoaded(fileName, fileUrl) {
   currentFileUrl = fileUrl;
 
-  // Update UI
+  // Update host UI
   document.getElementById('fileName').textContent = fileName;
   document.getElementById('fileInfo').classList.remove('hidden');
   document.getElementById('uploadZone').style.display = 'none';
 
-  // Listener view
-  updateListenerStatus('loading');
+  // If not activated yet (mobile), just update status and wait for tap
+  if (!audioActivated) {
+    updateListenerStatus('waiting');
+    return;
+  }
 
   // Load audio
+  updateListenerStatus('loading');
   try {
     await loadAudio(fileUrl);
     document.getElementById('hostPlayer').classList.add('visible');
@@ -845,12 +849,19 @@ async function onFileLoaded(fileName, fileUrl) {
 }
 
 async function loadAudio(url) {
+  // Fetch audio data first (no AudioContext needed yet)
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const arrayBuffer = await res.arrayBuffer();
+
+  // Create AudioContext if needed
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   }
 
-  const res = await fetch(url);
-  const arrayBuffer = await res.arrayBuffer();
+  // iOS REQUIRES resume() before decodeAudioData works
+  await audioCtx.resume();
+
   audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
   audioDuration = audioBuffer.duration;
 
@@ -1079,22 +1090,38 @@ function activateAudio() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   }
-  audioCtx.resume().then(() => {
+  audioCtx.resume().then(async () => {
     audioActivated = true;
     document.getElementById('activateAudioBox').classList.add('hidden');
     document.getElementById('listenerReady').classList.remove('hidden');
-    showToast('Audio ready!');
-    if (currentFileUrl) updateListenerStatus();
+
+    // If file already loaded by server but audio buffer not ready yet — load now
+    if (currentFileUrl && !audioBuffer) {
+      updateListenerStatus('loading');
+      try {
+        await loadAudio(currentFileUrl);
+        updateListenerStatus('ready');
+        showToast('Audio ready!');
+      } catch (e) {
+        updateListenerStatus('error');
+        showToast('Error: ' + e.message);
+      }
+    } else {
+      showToast('Audio ready!');
+      if (currentFileUrl) updateListenerStatus('ready');
+    }
   });
 }
 
 function updateListenerStatus(state) {
   const el = document.getElementById('listenerStatus');
   if (!el) return;
-  if (state === 'loading') {
+  if (state === 'waiting') {
+    el.innerHTML = `<div style="color:var(--warn); margin-bottom:4px;">🎵 File received from host</div><div style="font-size:11px; color:var(--muted);">Tap "Activate Audio" button above to load it.</div>`;
+  } else if (state === 'loading') {
     el.innerHTML = `<span class="spinner"></span> Loading audio file...`;
   } else if (state === 'ready') {
-    el.innerHTML = `<div style="color:var(--accent); margin-bottom:4px;">🎵 File loaded & ready</div><div style="font-size:11px; color:var(--muted);">Waiting for host to press play...</div>`;
+    el.innerHTML = `<div style="color:var(--accent); margin-bottom:4px;">✅ File loaded & ready</div><div style="font-size:11px; color:var(--muted);">Waiting for host to press play...</div>`;
   } else if (state === 'error') {
     el.innerHTML = `<div style="color:var(--danger);">❌ Failed to load audio.<br><span style="font-size:11px;">Try refreshing the page.</span></div>`;
   } else if (currentFileUrl) {
