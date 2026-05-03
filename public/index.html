@@ -309,6 +309,7 @@ const SYNC_INTERVAL_MS = 30000; // re-sync every 30s
 
 // Current file
 let currentFileUrl = null;
+let currentFileUrlName = null;
 let audioActivated = false;
 
 // Silent audio for iOS mute bypass
@@ -439,6 +440,12 @@ function joinSession() {
 
   dbg('Joined as: ' + name, '#00ff88');
   showToast('Welcome, ' + name + '!');
+
+  // If server already has a file loaded (init told us), load it now
+  if (currentFileUrl && audioActivated) {
+    dbg('File already on server, loading now...', '#ffaa00');
+    onFileLoaded(currentFileUrlName || 'audio', currentFileUrl, false);
+  }
 }
 
 // =============================================================
@@ -451,6 +458,9 @@ function handleMessage(msg) {
       myClientId = msg.clientId;
       updateDeviceCount(msg.sessionCount);
       if (msg.audioFile) {
+        // Store for later use if user joins after init
+        currentFileUrl = msg.audioFile.fileUrl;
+        currentFileUrlName = msg.audioFile.fileName;
         onFileLoaded(msg.audioFile.fileName, msg.audioFile.fileUrl, false);
         // If was playing, resume at correct position
         if (msg.isPlaying && msg.startServerTime) {
@@ -559,6 +569,7 @@ async function uploadFile(input) {
 
 async function onFileLoaded(fileName, fileUrl, isNew) {
   currentFileUrl = fileUrl;
+  currentFileUrlName = fileName;
 
   // Update host UI
   document.getElementById('fileName').textContent = fileName;
@@ -917,7 +928,7 @@ async function activateAudio() {
     document.getElementById('activateBox').classList.add('hidden');
     document.getElementById('listenerReady').classList.remove('hidden');
 
-    if (currentFileUrl && !audioBuffer) {
+    if (currentFileUrl) {
       setListenerStatus('<span class="spinner"></span> Loading audio...', '');
       try {
         await loadAudio(currentFileUrl);
@@ -928,7 +939,7 @@ async function activateAudio() {
         setListenerStatus('❌ Error loading: ' + e.message, '#ff4444');
         dbg('Load error: ' + e.message, '#ff4444');
       }
-    } else if (!currentFileUrl) {
+    } else {
       setListenerStatus('Waiting for host to load a file...', '');
     }
     showToast('Audio activated!');
