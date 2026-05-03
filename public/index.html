@@ -582,7 +582,7 @@ async function onFileLoaded(fileName, fileUrl, isNew) {
   if (isNew) {
     isPaused = false;
     pausedAtOffset = 0;
-    stopAudioSource();
+    stopPlayback(true);
     updatePlayBtn(false);
     updateProgress(0);
     audioBuffer = null;
@@ -597,13 +597,15 @@ async function onFileLoaded(fileName, fileUrl, isNew) {
     setListenerStatus('<span class="spinner"></span> Loading audio...', '');
   }
 
-  // Load audio buffer
-  if (audioActivated) {
+  // Load audio — always load for host, only if activated for listener
+  const shouldLoad = (role === 'host') || audioActivated;
+  if (shouldLoad) {
     try {
+      dbg('Loading audio for role: ' + role, '#0088ff');
       await loadAudio(fileUrl);
       if (role === 'listener') setListenerStatus('✅ File loaded & ready — waiting for host', '#00ff88');
       document.getElementById('totalTime').textContent = formatTime(audioDuration);
-      dbg('Audio buffer ready. Duration: ' + audioDuration.toFixed(1) + 's', '#00ff88');
+      dbg('Audio ready! Duration: ' + audioDuration.toFixed(1) + 's role=' + role, '#00ff88');
 
       // Tell server this listener is ready
       if (role === 'listener') send({ type: 'listener_ready' });
@@ -654,13 +656,13 @@ async function loadAudio(url) {
     }, { once: true });
 
     window.playerAudio.src = url;
+    dbg('playerAudio.src set to: ' + url, '#0088ff');
     window.playerAudio.load();
   });
 
-  // Mark as ready — use playerAudio as the readiness flag
-  audioBuffer = window.playerAudio; // truthy, actual HTMLAudioElement
-
-  dbg('playerAudio ready. readyState=' + window.playerAudio.readyState, '#00ff88');
+  // Mark as ready
+  audioBuffer = window.playerAudio; // truthy flag
+  dbg('playerAudio ready! readyState=' + window.playerAudio.readyState + ' src=' + window.playerAudio.src.slice(-20), '#00ff88');
 }
 
 function resetUpload() {
@@ -723,10 +725,10 @@ function getCurrentOffset() {
 // SCHEDULE PLAY (all devices execute this)
 // =============================================================
 function schedulePlay(playAtServerTime, startOffset) {
-  dbg('schedulePlay. buffer=' + !!audioBuffer + ' playerAudio=' + !!window.playerAudio, '#ffaa00');
+  dbg('schedulePlay. audioBuffer=' + !!audioBuffer + ' playerAudio=' + !!window.playerAudio + ' duration=' + audioDuration + ' src=' + (window.playerAudio ? window.playerAudio.src.slice(-20) : 'none'), '#ffaa00');
 
-  if (!window.playerAudio || !audioDuration) {
-    dbg('ABORT: not ready', '#ff4444');
+  if (!window.playerAudio || !audioDuration || !window.playerAudio.src || window.playerAudio.src === location.href) {
+    dbg('ABORT: playerAudio not ready. readyState=' + (window.playerAudio ? window.playerAudio.readyState : 'N/A'), '#ff4444');
     return;
   }
 
