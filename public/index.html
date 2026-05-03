@@ -831,12 +831,13 @@ async function uploadFile(input) {
 async function onFileLoaded(fileName, fileUrl) {
   currentFileUrl = fileUrl;
 
-  // Update host UI
+  // Always update host UI
   document.getElementById('fileName').textContent = fileName;
   document.getElementById('fileInfo').classList.remove('hidden');
   document.getElementById('uploadZone').style.display = 'none';
+  document.getElementById('hostPlayer').classList.add('visible'); // always show player
 
-  // If not activated yet (mobile), just update status and wait for tap
+  // If not activated yet (mobile listener), just update status and wait for tap
   if (!audioActivated) {
     updateListenerStatus('waiting');
     return;
@@ -846,7 +847,6 @@ async function onFileLoaded(fileName, fileUrl) {
   updateListenerStatus('loading');
   try {
     await loadAudio(fileUrl);
-    document.getElementById('hostPlayer').classList.add('visible');
     updateListenerStatus('ready');
     showToast('Audio ready!');
   } catch (e) {
@@ -897,22 +897,26 @@ function schedulePlay(playAtServerTime, startOffset) {
 
   const nowServer = serverTimeNow();
   const msUntilPlay = playAtServerTime - nowServer;
-  const audioCtxPlayAt = audioCtx.currentTime + Math.max(0, msUntilPlay / 1000);
 
-  dbg('msUntilPlay: ' + msUntilPlay.toFixed(0) + 'ms, playAt audioCtx: ' + audioCtxPlayAt.toFixed(2), '#ffaa00');
+  // If already past the scheduled time (due to high latency), play immediately with small buffer
+  const safeMs = Math.max(msUntilPlay, 100);
+  const audioCtxPlayAt = audioCtx.currentTime + (safeMs / 1000);
+
+  dbg('msUntilPlay: ' + msUntilPlay.toFixed(0) + 'ms, safeMs: ' + safeMs.toFixed(0) + 'ms', '#ffaa00');
+  dbg('audioCtx.currentTime: ' + audioCtx.currentTime.toFixed(3) + ', playAt: ' + audioCtxPlayAt.toFixed(3), '#ffaa00');
 
   audioSource = audioCtx.createBufferSource();
   audioSource.buffer = audioBuffer;
   audioSource.connect(audioCtx.destination);
   audioSource.start(audioCtxPlayAt, startOffset);
 
-  dbg('audioSource.start() called!', '#00ff88');
+  dbg('audioSource.start() called! Will play in ' + safeMs.toFixed(0) + 'ms', '#00ff88');
 
   playbackStartAudioCtxTime = audioCtxPlayAt - startOffset;
   playbackStartOffset = startOffset;
   isPlaying = true;
 
-  if (msUntilPlay > 500) showCountdown(msUntilPlay);
+  if (safeMs > 500) showCountdown(safeMs);
   updatePlayBtn(true);
   startProgressUpdate();
 
