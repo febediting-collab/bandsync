@@ -956,6 +956,8 @@ function togglePlay() {
 
   audioCtx.resume().then(() => {
     dbg('AudioCtx resumed, state: ' + audioCtx.state + ', sending: ' + (isPlaying ? 'stop' : 'play'), '#0088ff');
+    bypassSilentMode();
+    requestWakeLock();
     if (isPlaying) {
       send({ type: 'stop' });
     } else {
@@ -1139,6 +1141,10 @@ function activateAudio() {
   audioCtx.resume().then(async () => {
     dbg('AudioCtx resumed, state: ' + audioCtx.state, '#00ff88');
     audioActivated = true;
+
+    // Bypass iOS mute switch + prevent screen sleep
+    bypassSilentMode();
+    requestWakeLock();
     document.getElementById('activateAudioBox').classList.add('hidden');
     document.getElementById('listenerReady').classList.remove('hidden');
 
@@ -1181,6 +1187,59 @@ function updateListenerStatus(state) {
   } else {
     el.textContent = 'Waiting for host to load a file...';
   }
+}
+
+// ============================================
+// WAKE LOCK — prevent screen off killing audio
+// ============================================
+let wakeLock = null;
+
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      dbg('Wake lock acquired', '#00ff88');
+      wakeLock.addEventListener('release', () => {
+        dbg('Wake lock released — re-acquiring...', '#ffaa00');
+        requestWakeLock();
+      });
+    } else {
+      dbg('Wake Lock API not supported', '#ffaa00');
+    }
+  } catch (e) {
+    dbg('Wake lock failed: ' + e.message, '#ffaa00');
+  }
+}
+
+// Re-acquire wake lock when page becomes visible again
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && isPlaying) {
+    requestWakeLock();
+  }
+});
+
+// ============================================
+// SILENT MODE BYPASS — iOS mute switch workaround
+// Play a silent HTMLAudioElement to unlock audio session
+// ============================================
+let silentAudio = null;
+
+function bypassSilentMode() {
+  // Create a silent audio element — this registers app as "media app"
+  // which bypasses the iOS mute switch for Web Audio API
+  if (silentAudio) return;
+
+  // Tiny silent MP3 as base64 (0.1s of silence)
+  const silentMp3 = 'data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU2LjM2LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU2LjQxAAAAAAAAAAAAAAAAJAAAAAAAAAAAASDs90hvAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV';
+
+  silentAudio = new Audio(silentMp3);
+  silentAudio.loop = true;
+  silentAudio.volume = 0.001; // nearly silent but not zero
+  silentAudio.play().then(() => {
+    dbg('Silent audio playing — mute switch bypassed', '#00ff88');
+  }).catch(e => {
+    dbg('Silent audio failed: ' + e.message, '#ffaa00');
+  });
 }
 
 // ============================================
