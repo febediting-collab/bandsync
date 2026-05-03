@@ -697,13 +697,12 @@ function schedulePlay(playAtServerTime, startOffset) {
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   audioCtx.resume();
 
-  stopAudioSource();
+  // Stop any existing source cleanly
+  stopAudioSource(false); // false = don't reset isPlaying yet
 
   const nowServer = serverTimeNow();
   const msUntilPlay = playAtServerTime - nowServer;
-  // Apply per-device calibration offset (positive = play later)
   const adjustedMs = msUntilPlay - deviceOffsetMs;
-  // Minimum 80ms to avoid scheduling in the past
   const safeMs = Math.max(adjustedMs, 80);
   const audioCtxPlayAt = audioCtx.currentTime + (safeMs / 1000);
 
@@ -723,11 +722,17 @@ function schedulePlay(playAtServerTime, startOffset) {
 
   if (safeMs > 500) showCountdown(safeMs);
   updatePlayBtn(true);
-  startProgressUpdate();
+
+  // Start progress update AFTER the countdown ends
+  const progressDelay = Math.max(0, safeMs);
+  setTimeout(() => {
+    if (isPlaying) startProgressUpdate();
+  }, progressDelay);
 
   audioSource.onended = () => {
     dbg('Audio ended naturally', '#aaa');
-    if (isPlaying) { // only if not stopped externally
+    // Only reset if it ended naturally (not stopped externally)
+    if (isPlaying) {
       isPlaying = false;
       isPaused = false;
       pausedAtOffset = 0;
@@ -738,13 +743,15 @@ function schedulePlay(playAtServerTime, startOffset) {
   };
 }
 
-function stopAudioSource() {
+function stopAudioSource(resetState = true) {
   stopProgressUpdate();
   if (audioSource) {
     try { audioSource.stop(); } catch(e) {}
     audioSource = null;
   }
-  isPlaying = false;
+  if (resetState) {
+    isPlaying = false;
+  }
 }
 
 // =============================================================
