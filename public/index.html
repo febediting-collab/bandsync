@@ -943,19 +943,25 @@ function stopAudio() {
 }
 
 function togglePlay() {
-  if (!audioBuffer) return;
+  dbg('togglePlay called. audioBuffer=' + !!audioBuffer + ' isPlaying=' + isPlaying, '#0088ff');
+  if (!audioBuffer) {
+    dbg('ABORT: no audioBuffer', '#ff4444');
+    return;
+  }
 
-  // Need user gesture to resume AudioContext
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    dbg('AudioCtx created in togglePlay, state: ' + audioCtx.state, '#0088ff');
   }
-  audioCtx.resume();
 
-  if (isPlaying) {
-    send({ type: 'stop' });
-  } else {
-    send({ type: 'play', offset: 0 });
-  }
+  audioCtx.resume().then(() => {
+    dbg('AudioCtx resumed, state: ' + audioCtx.state + ', sending: ' + (isPlaying ? 'stop' : 'play'), '#0088ff');
+    if (isPlaying) {
+      send({ type: 'stop' });
+    } else {
+      send({ type: 'play', offset: 0 });
+    }
+  });
 }
 
 function seekTo(event) {
@@ -1024,6 +1030,18 @@ function switchRole(r) {
   document.getElementById('tabListener').classList.toggle('active', r === 'listener');
   document.getElementById('hostView').classList.toggle('hidden', r !== 'host');
   document.getElementById('listenerView').classList.toggle('hidden', r !== 'listener');
+
+  // Host mode: auto-activate audio (no mobile restriction needed)
+  if (r === 'host') {
+    audioActivated = true;
+    dbg('Host mode: audioActivated=true', '#00ff88');
+  } else {
+    // Listener: reset activation if not yet activated via button
+    if (!document.getElementById('listenerReady') || document.getElementById('listenerReady').classList.contains('hidden')) {
+      audioActivated = false;
+      dbg('Listener mode: audioActivated=false, tap button to activate', '#ffaa00');
+    }
+  }
 }
 
 function setStatus(state, text) {
@@ -1110,7 +1128,7 @@ function dbg(msg, color) {
 // ============================================
 // AUDIO ACTIVATION (mobile browser unlock)
 // ============================================
-let audioActivated = false;
+let audioActivated = true; // default true — host doesn't need activation. Listeners set this via tap.
 
 function activateAudio() {
   dbg('Activate tapped', '#0088ff');
