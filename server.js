@@ -108,9 +108,10 @@ wss.on('connection', (ws) => {
       // Join session gate
       case 'join':
         client.name = (msg.name || 'Unknown').slice(0, 20);
-        client.role = 'host'; // default to host on join
+        client.role = msg.role || 'host'; // use role sent by client
         client.joined = true;
-        console.log('Client ' + clientId + ' joined as: ' + client.name);
+        if (client.role === 'host') { client.audioActivated = true; client.audioReady = true; }
+        console.log('Client ' + clientId + ' joined as: ' + client.name + ' role: ' + client.role);
         broadcastSession();
         break;
 
@@ -126,6 +127,11 @@ wss.on('connection', (ws) => {
         break;
 
       // Listener audio states
+      case 'listener_activated':
+        client.audioActivated = true;
+        broadcastSession();
+        break;
+
       case 'listener_ready':
         client.audioReady = true;
         client.audioActivated = true;
