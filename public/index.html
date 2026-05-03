@@ -424,7 +424,7 @@ function joinSession() {
   myName = name;
   hasJoined = true;
 
-  send({ type: 'join', name });
+  send({ type: 'join', name, role: 'host' }); // default host, updated when switching
 
   document.getElementById('joinBtn').disabled = true;
   document.getElementById('nameInput').disabled = true;
@@ -524,6 +524,7 @@ function switchRole(r) {
     audioActivated = true;
   }
 
+  // Always send role to server, including current join state
   send({ type: 'set_role', role: r });
   dbg('Role set to: ' + r, '#0088ff');
 }
@@ -605,48 +606,50 @@ async function onFileLoaded(fileName, fileUrl, isNew) {
 async function loadAudio(url) {
   dbg('Loading audio: ' + url, '#0088ff');
 
-  // Create/reset HTML audio element — this is our PRIMARY player
-  // HTMLAudioElement keeps playing when screen is off, unlike Web Audio API
+  // Reset playerAudio
   if (window.playerAudio) {
     window.playerAudio.pause();
-    window.playerAudio.src = '';
+    window.playerAudio.removeAttribute('src');
+    window.playerAudio.load();
   }
+
+  // Create fresh HTMLAudioElement — primary player (works with screen off)
   window.playerAudio = new Audio();
   window.playerAudio.preload = 'auto';
-  window.playerAudio.src = url;
 
-  // Wait for enough data to know duration
+  // Wait for metadata (duration available)
   await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('Load timeout')), 30000);
+    const timeout = setTimeout(() => {
+      dbg('Metadata timeout — trying anyway', '#ffaa00');
+      if (window.playerAudio.readyState >= 1) {
+        audioDuration = window.playerAudio.duration || 0;
+        resolve();
+      } else {
+        reject(new Error('Load timeout'));
+      }
+    }, 20000);
+
     window.playerAudio.addEventListener('loadedmetadata', () => {
       clearTimeout(timeout);
       audioDuration = window.playerAudio.duration;
-      dbg('Audio metadata loaded. Duration: ' + audioDuration.toFixed(1) + 's', '#00ff88');
+      dbg('Metadata OK. Duration: ' + audioDuration.toFixed(1) + 's', '#00ff88');
       resolve();
     }, { once: true });
-    window.playerAudio.addEventListener('error', (e) => {
+
+    window.playerAudio.addEventListener('error', () => {
       clearTimeout(timeout);
-      reject(new Error('Audio load error: ' + (window.playerAudio.error ? window.playerAudio.error.message : 'unknown')));
+      const err = window.playerAudio.error;
+      reject(new Error('Audio error code ' + (err ? err.code : '?')));
     }, { once: true });
+
+    window.playerAudio.src = url;
     window.playerAudio.load();
   });
 
-  // Also decode for AudioContext (used only for precise clock sync scheduling)
-  // We fetch separately since playerAudio already has the URL
-  try {
-    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    await audioCtx.resume();
-    const res = await fetch(url);
-    const arrayBuffer = await res.arrayBuffer();
-    audioBuffer = await new Promise((resolve, reject) => {
-      audioCtx.decodeAudioData(arrayBuffer, resolve, reject);
-    });
-    dbg('AudioCtx buffer decoded for sync scheduling', '#0088ff');
-  } catch(e) {
-    dbg('AudioCtx decode warn (non-fatal): ' + e.message, '#ffaa00');
-    // Non-fatal — HTMLAudio still works without Web Audio sync
-    audioBuffer = true; // truthy flag so code doesn't abort
-  }
+  // Mark as ready — use playerAudio as the readiness flag
+  audioBuffer = window.playerAudio; // truthy, actual HTMLAudioElement
+
+  dbg('playerAudio ready. readyState=' + window.playerAudio.readyState, '#00ff88');
 }
 
 function resetUpload() {
@@ -670,7 +673,7 @@ function resetUpload() {
 // PLAYBACK CONTROL (host sends commands)
 // =============================================================
 function togglePlay() {
-  if (!audioBuffer) { showToast('No audio loaded'); return; }
+  if (!window.playerAudio || !audioDuration) { showToast('No audio loaded'); return; }
 
   bypassSilentMode();
   requestWakeLock();
@@ -711,7 +714,7 @@ function getCurrentOffset() {
 function schedulePlay(playAtServerTime, startOffset) {
   dbg('schedulePlay. buffer=' + !!audioBuffer + ' playerAudio=' + !!window.playerAudio, '#ffaa00');
 
-  if (!window.playerAudio || !audioBuffer) {
+  if (!window.playerAudio || !audioDuration) {
     dbg('ABORT: not ready', '#ff4444');
     return;
   }
@@ -904,6 +907,9 @@ async function activateAudio() {
     await audioCtx.resume();
     dbg('AudioCtx resumed: ' + audioCtx.state, '#00ff88');
     audioActivated = true;
+
+    // Notify server immediately so device shows as activated
+    send({ type: 'listener_activated' });
 
     bypassSilentMode();
     requestWakeLock();
