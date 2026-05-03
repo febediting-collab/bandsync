@@ -320,6 +320,7 @@ let wakeLock = null;
 // Progress RAF
 let progressRAF = null;
 
+let _suppressNextCountdown = false;
 // Seek drag state
 let isSeeking = false;
 let seekRatio = 0;
@@ -473,6 +474,8 @@ function handleMessage(msg) {
       break;
 
     case 'file_loaded':
+      // Cut off any current playback immediately on all devices
+      stopPlayback(true);
       onFileLoaded(msg.fileName, msg.fileUrl, true);
       break;
 
@@ -484,7 +487,10 @@ function handleMessage(msg) {
     case 'pause':
       pausedAtOffset = msg.pausedAtOffset;
       isPaused = true;
-      stopAudioSource();
+      if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
+      stopProgressUpdate();
+      if (window.playerAudio) window.playerAudio.pause();
+      isPlaying = false;
       updatePlayBtn(false);
       updateProgress(pausedAtOffset);
       dbg('Paused at ' + pausedAtOffset.toFixed(2) + 's', '#ffaa00');
@@ -493,7 +499,7 @@ function handleMessage(msg) {
     case 'stop':
       isPaused = false;
       pausedAtOffset = 0;
-      stopAudioSource();
+      stopPlayback(true);
       updatePlayBtn(false);
       updateProgress(0);
       break;
@@ -597,26 +603,50 @@ async function onFileLoaded(fileName, fileUrl, isNew) {
 }
 
 async function loadAudio(url) {
-  dbg('Fetching audio: ' + url, '#0088ff');
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  const arrayBuffer = await res.arrayBuffer();
-  dbg('Fetched ' + (arrayBuffer.byteLength/1024).toFixed(0) + 'KB, decoding...', '#0088ff');
+  dbg('Loading audio: ' + url, '#0088ff');
 
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  await audioCtx.resume();
-  dbg('AudioCtx state: ' + audioCtx.state, '#0088ff');
+  // Create/reset HTML audio element — this is our PRIMARY player
+  // HTMLAudioElement keeps playing when screen is off, unlike Web Audio API
+  if (window.playerAudio) {
+    window.playerAudio.pause();
+    window.playerAudio.src = '';
+  }
+  window.playerAudio = new Audio();
+  window.playerAudio.preload = 'auto';
+  window.playerAudio.src = url;
 
-  return new Promise((resolve, reject) => {
-    audioCtx.decodeAudioData(arrayBuffer, (buf) => {
-      audioBuffer = buf;
-      audioDuration = buf.duration;
-      dbg('Decode OK! Duration: ' + audioDuration.toFixed(1) + 's', '#00ff88');
+  // Wait for enough data to know duration
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Load timeout')), 30000);
+    window.playerAudio.addEventListener('loadedmetadata', () => {
+      clearTimeout(timeout);
+      audioDuration = window.playerAudio.duration;
+      dbg('Audio metadata loaded. Duration: ' + audioDuration.toFixed(1) + 's', '#00ff88');
       resolve();
-    }, (e) => {
-      reject(new Error('Decode failed: ' + (e ? e.message : 'unknown')));
-    });
+    }, { once: true });
+    window.playerAudio.addEventListener('error', (e) => {
+      clearTimeout(timeout);
+      reject(new Error('Audio load error: ' + (window.playerAudio.error ? window.playerAudio.error.message : 'unknown')));
+    }, { once: true });
+    window.playerAudio.load();
   });
+
+  // Also decode for AudioContext (used only for precise clock sync scheduling)
+  // We fetch separately since playerAudio already has the URL
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    await audioCtx.resume();
+    const res = await fetch(url);
+    const arrayBuffer = await res.arrayBuffer();
+    audioBuffer = await new Promise((resolve, reject) => {
+      audioCtx.decodeAudioData(arrayBuffer, resolve, reject);
+    });
+    dbg('AudioCtx buffer decoded for sync scheduling', '#0088ff');
+  } catch(e) {
+    dbg('AudioCtx decode warn (non-fatal): ' + e.message, '#ffaa00');
+    // Non-fatal — HTMLAudio still works without Web Audio sync
+    audioBuffer = true; // truthy flag so code doesn't abort
+  }
 }
 
 function resetUpload() {
@@ -626,7 +656,13 @@ function resetUpload() {
   document.getElementById('fileInput').value = '';
   audioBuffer = null;
   currentFileUrl = null;
-  stopAudioSource();
+  // Stop and clear audio
+  if (window.playerAudio) { window.playerAudio.pause(); window.playerAudio.src = ''; }
+  stopProgressUpdate();
+  isPlaying = false;
+  isPaused = false;
+  pausedAtOffset = 0;
+  updatePlayBtn(false);
   updateProgress(0);
 }
 
@@ -635,121 +671,124 @@ function resetUpload() {
 // =============================================================
 function togglePlay() {
   if (!audioBuffer) { showToast('No audio loaded'); return; }
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-  audioCtx.resume().then(() => {
-    bypassSilentMode();
-    requestWakeLock();
+  bypassSilentMode();
+  requestWakeLock();
 
-    if (isPlaying) {
-      // Pause
-      const currentOffset = getCurrentOffset();
-      send({ type: 'pause', pausedAtOffset: currentOffset });
-      dbg('Sending pause at ' + currentOffset.toFixed(2) + 's', '#ffaa00');
-    } else if (isPaused) {
-      // Resume from paused position
-      send({ type: 'play', offset: pausedAtOffset });
-      dbg('Sending resume from ' + pausedAtOffset.toFixed(2) + 's', '#ffaa00');
-    } else {
-      // Fresh play
-      send({ type: 'play', offset: 0 });
-      dbg('Sending play from start', '#ffaa00');
-    }
-  });
+  if (isPlaying) {
+    const currentOffset = getCurrentOffset();
+    send({ type: 'pause', pausedAtOffset: currentOffset });
+    dbg('Sending pause at ' + currentOffset.toFixed(2) + 's', '#ffaa00');
+  } else if (isPaused) {
+    send({ type: 'play', offset: pausedAtOffset });
+    dbg('Sending resume from ' + pausedAtOffset.toFixed(2) + 's', '#ffaa00');
+  } else {
+    send({ type: 'play', offset: 0 });
+    dbg('Sending play from start', '#ffaa00');
+  }
 }
 
 function skipBack() {
   const offset = Math.max(0, getCurrentOffset() - 10);
-  if (isPlaying) {
-    send({ type: 'play', offset });
-  } else {
-    pausedAtOffset = offset;
-    updateProgress(offset);
-  }
+  if (isPlaying) { send({ type: 'play', offset }); }
+  else { pausedAtOffset = offset; updateProgress(offset); }
 }
 
 function skipForward() {
   const offset = Math.min(audioDuration - 1, getCurrentOffset() + 10);
-  if (isPlaying) {
-    send({ type: 'play', offset });
-  } else {
-    pausedAtOffset = offset;
-    updateProgress(offset);
-  }
+  if (isPlaying) { send({ type: 'play', offset }); }
+  else { pausedAtOffset = offset; updateProgress(offset); }
 }
 
 function getCurrentOffset() {
-  if (!isPlaying || !audioCtx || playbackStartAudioCtxTime === null) return pausedAtOffset;
-  return Math.min(audioCtx.currentTime - playbackStartAudioCtxTime, audioDuration);
+  if (!isPlaying || !window.playerAudio) return pausedAtOffset;
+  return Math.min(window.playerAudio.currentTime, audioDuration);
 }
 
 // =============================================================
-// SCHEDULE PLAY (all devices)
+// SCHEDULE PLAY (all devices execute this)
 // =============================================================
 function schedulePlay(playAtServerTime, startOffset) {
-  dbg('schedulePlay. buffer=' + !!audioBuffer + ' ctx=' + !!audioCtx, '#ffaa00');
+  dbg('schedulePlay. buffer=' + !!audioBuffer + ' playerAudio=' + !!window.playerAudio, '#ffaa00');
 
-  if (!audioBuffer) {
-    dbg('ABORT: no audioBuffer', '#ff4444');
+  if (!window.playerAudio || !audioBuffer) {
+    dbg('ABORT: not ready', '#ff4444');
     return;
   }
 
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  audioCtx.resume();
+  bypassSilentMode();
+  requestWakeLock();
 
-  // Stop any existing source cleanly
-  stopAudioSource(false); // false = don't reset isPlaying yet
+  // Stop any current playback cleanly
+  stopPlayback(false);
 
   const nowServer = serverTimeNow();
   const msUntilPlay = playAtServerTime - nowServer;
   const adjustedMs = msUntilPlay - deviceOffsetMs;
-  const safeMs = Math.max(adjustedMs, 80);
-  const audioCtxPlayAt = audioCtx.currentTime + (safeMs / 1000);
+  const safeMs = Math.max(adjustedMs, 100);
 
-  dbg('msUntilPlay=' + msUntilPlay.toFixed(0) + 'ms safeMs=' + safeMs.toFixed(0) + 'ms offset=' + startOffset.toFixed(2) + 's', '#ffaa00');
+  dbg('msUntilPlay=' + msUntilPlay.toFixed(0) + 'ms adjusted=' + adjustedMs.toFixed(0) + 'ms safeMs=' + safeMs.toFixed(0) + 'ms', '#ffaa00');
 
-  audioSource = audioCtx.createBufferSource();
-  audioSource.buffer = audioBuffer;
-  audioSource.connect(audioCtx.destination);
-  audioSource.start(audioCtxPlayAt, startOffset);
-
-  playbackStartAudioCtxTime = audioCtxPlayAt - startOffset;
+  // Set position
+  window.playerAudio.currentTime = startOffset;
   playbackStartOffset = startOffset;
-  isPlaying = true;
+
+  isPlaying = false; // will be set true when play actually starts
   isPaused = false;
 
-  dbg('start() called! Will play in ' + safeMs.toFixed(0) + 'ms', '#00ff88');
-
   if (safeMs > 500) showCountdown(safeMs);
-  updatePlayBtn(true);
+  updatePlayBtn(false); // show paused until it actually starts
 
-  // Start progress update AFTER the countdown ends
-  const progressDelay = Math.max(0, safeMs);
-  setTimeout(() => {
-    if (isPlaying) startProgressUpdate();
-  }, progressDelay);
-
-  audioSource.onended = () => {
-    dbg('Audio ended naturally', '#aaa');
-    // Only reset if it ended naturally (not stopped externally)
-    if (isPlaying) {
-      isPlaying = false;
-      isPaused = false;
-      pausedAtOffset = 0;
-      updatePlayBtn(false);
-      stopProgressUpdate();
-      updateProgress(0);
+  // Schedule play using setTimeout (HTMLAudio doesn't have audioCtx precision,
+  // but safeMs gives enough buffer for smooth sync)
+  const startTimer = setTimeout(() => {
+    if (!window.playerAudio) return;
+    window.playerAudio.currentTime = startOffset; // re-confirm position
+    const playPromise = window.playerAudio.play();
+    if (playPromise) {
+      playPromise.then(() => {
+        isPlaying = true;
+        isPaused = false;
+        updatePlayBtn(true);
+        startProgressUpdate();
+        dbg('HTMLAudio playing! currentTime=' + window.playerAudio.currentTime.toFixed(2), '#00ff88');
+      }).catch(e => {
+        dbg('Play failed: ' + e.message, '#ff4444');
+      });
+    } else {
+      isPlaying = true;
+      updatePlayBtn(true);
+      startProgressUpdate();
     }
+  }, safeMs);
+
+  // Store timer ref so we can cancel if stop/pause comes before play starts
+  window._playTimer = startTimer;
+
+  // Handle natural end
+  window.playerAudio.onended = () => {
+    dbg('Audio ended naturally', '#aaa');
+    isPlaying = false;
+    isPaused = false;
+    pausedAtOffset = 0;
+    updatePlayBtn(false);
+    stopProgressUpdate();
+    updateProgress(0);
   };
 }
 
-function stopAudioSource(resetState = true) {
+function stopPlayback(resetState = true) {
+  if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
   stopProgressUpdate();
-  if (audioSource) {
-    try { audioSource.stop(); } catch(e) {}
-    audioSource = null;
+  if (window.playerAudio) {
+    window.playerAudio.pause();
+    if (resetState) window.playerAudio.currentTime = 0;
   }
   if (resetState) {
+    isPlaying = false;
+    isPaused = false;
+    pausedAtOffset = 0;
+  } else {
     isPlaying = false;
   }
 }
@@ -760,8 +799,8 @@ function stopAudioSource(resetState = true) {
 function startProgressUpdate() {
   stopProgressUpdate();
   function tick() {
-    if (!isPlaying || !audioCtx || playbackStartAudioCtxTime === null) return;
-    const elapsed = audioCtx.currentTime - playbackStartAudioCtxTime;
+    if (!isPlaying || !window.playerAudio) return;
+    const elapsed = window.playerAudio.currentTime;
     updateProgress(Math.max(0, Math.min(elapsed, audioDuration)));
     progressRAF = requestAnimationFrame(tick);
   }
@@ -801,6 +840,7 @@ function onSeekEnd(e) {
   window.removeEventListener('mouseup', onSeekEnd);
   const offset = seekRatio * audioDuration;
   if (isPlaying) {
+    _suppressNextCountdown = true;
     send({ type: 'play', offset });
   } else {
     pausedAtOffset = offset;
@@ -835,6 +875,7 @@ function onSeekTouchEnd() {
   window.removeEventListener('touchend', onSeekTouchEnd);
   const offset = seekRatio * audioDuration;
   if (isPlaying) {
+    _suppressNextCountdown = true;
     send({ type: 'play', offset });
   } else {
     pausedAtOffset = offset;
@@ -933,6 +974,11 @@ document.addEventListener('visibilitychange', () => {
 // COUNTDOWN
 // =============================================================
 function showCountdown(msUntilPlay) {
+  if (_suppressNextCountdown) {
+    _suppressNextCountdown = false;
+    dbg('Countdown suppressed (seek)', '#aaa');
+    return;
+  }
   const overlay = document.getElementById('countdownOverlay');
   const num = document.getElementById('countdownNumber');
   overlay.classList.add('visible');
