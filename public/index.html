@@ -484,12 +484,20 @@ function handleMessage(msg) {
       break;
 
     case 'file_loaded':
-      // Cut off any current playback immediately
-      stopPlayback(true);
-      // Reset audio state so device re-loads new file
-      audioBuffer = null;
-      if (window.playerAudio) { window.playerAudio.pause(); window.playerAudio.src = ''; }
-      audioDuration = 0;
+      // Fully cancel any running play session before loading new file
+      _playSession++;
+      if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
+      stopProgressUpdate();
+      isPlaying = false; isPaused = false; pausedAtOffset = 0;
+      audioBuffer = null; audioDuration = 0;
+      _suppressNextCountdown = false;
+      if (window.playerAudio) {
+        window.playerAudio.volume = 1;
+        window.playerAudio.pause();
+        window.playerAudio.src = '';
+      }
+      updatePlayBtn(false);
+      updateProgress(0);
       onFileLoaded(msg.fileName, msg.fileUrl, true);
       break;
 
@@ -499,23 +507,36 @@ function handleMessage(msg) {
       break;
 
     case 'pause':
+      _playSession++; // cancel any running play session
+      if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
       pausedAtOffset = msg.pausedAtOffset;
       isPaused = true;
-      if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
-      stopProgressUpdate();
-      if (window.playerAudio) window.playerAudio.pause();
       isPlaying = false;
+      stopProgressUpdate();
+      if (window.playerAudio) {
+        window.playerAudio.volume = 1;
+        window.playerAudio.pause();
+      }
       updatePlayBtn(false);
       updateProgress(pausedAtOffset);
       dbg('Paused at ' + pausedAtOffset.toFixed(2) + 's', '#ffaa00');
       break;
 
     case 'stop':
+      _playSession++; // cancel any running play session
+      if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
       isPaused = false;
+      isPlaying = false;
       pausedAtOffset = 0;
-      stopPlayback(true);
+      stopProgressUpdate();
+      if (window.playerAudio) {
+        window.playerAudio.volume = 1;
+        window.playerAudio.pause();
+        window.playerAudio.currentTime = 0;
+      }
       updatePlayBtn(false);
       updateProgress(0);
+      dbg('Stopped', '#aaa');
       break;
 
     case 'kicked':
@@ -726,15 +747,16 @@ function togglePlay() {
   requestWakeLock();
 
   if (isPlaying) {
-    const currentOffset = getCurrentOffset();
-    send({ type: 'pause', pausedAtOffset: currentOffset });
-    dbg('Sending pause at ' + currentOffset.toFixed(2) + 's', '#ffaa00');
+    // Pause — get current position from actual audio element
+    const pos = window.playerAudio ? window.playerAudio.currentTime : pausedAtOffset;
+    dbg('Sending pause at ' + pos.toFixed(2) + 's', '#ffaa00');
+    send({ type: 'pause', pausedAtOffset: pos });
   } else if (isPaused) {
-    send({ type: 'play', offset: pausedAtOffset });
     dbg('Sending resume from ' + pausedAtOffset.toFixed(2) + 's', '#ffaa00');
+    send({ type: 'play', offset: pausedAtOffset });
   } else {
-    send({ type: 'play', offset: 0 });
     dbg('Sending play from start', '#ffaa00');
+    send({ type: 'play', offset: 0 });
   }
 }
 
@@ -756,14 +778,18 @@ function getCurrentOffset() {
 }
 
 // =============================================================
-// SCHEDULE PLAY (all devices execute this)
-// Strategy: play() immediately (unlocked from prior user gesture),
-// then use audio.currentTime adjustment for sync instead of setTimeout.
-// This bypasses iOS "not allowed from setTimeout" restriction.
+// SCHEDULE PLAY
+// Uses pre-roll trick: play() at volume=0 slightly before target,
+// then unmute at the exact right moment. This bypasses iOS restriction
+// of play() from setTimeout while still achieving sync accuracy.
 // =============================================================
+
+// Global session ID to cancel stale callbacks
+let _playSession = 0;
+
 function schedulePlay(playAtServerTime, startOffset) {
   const pa = window.playerAudio;
-  dbg('schedulePlay. pa=' + !!pa + ' duration=' + audioDuration + ' src=' + (pa ? pa.src.slice(-15) : 'none'), '#ffaa00');
+  dbg('schedulePlay pa=' + !!pa + ' dur=' + audioDuration.toFixed(1) + ' src=' + (pa ? pa.src.slice(-12) : 'none'), '#ffaa00');
 
   if (!pa || !audioDuration || !pa.src || pa.src === location.href) {
     dbg('ABORT: playerAudio not ready', '#ff4444');
@@ -773,11 +799,14 @@ function schedulePlay(playAtServerTime, startOffset) {
   bypassSilentMode();
   requestWakeLock();
 
-  // Cancel any pending timer
+  // Cancel any previous play session
+  _playSession++;
+  const mySession = _playSession;
   if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
 
-  // Stop current playback
+  // Hard stop current audio
   pa.pause();
+  pa.volume = 1;
   isPlaying = false;
   isPaused = false;
   stopProgressUpdate();
@@ -785,65 +814,62 @@ function schedulePlay(playAtServerTime, startOffset) {
   const nowServer = serverTimeNow();
   const msUntilPlay = playAtServerTime - nowServer;
   const adjustedMs = msUntilPlay - deviceOffsetMs;
-  // safeMs: how far in the future to start. Minimum 50ms.
-  const safeMs = Math.max(adjustedMs, 50);
+  const safeMs = Math.max(adjustedMs, 80); // minimum 80ms buffer
 
-  dbg('msUntilPlay=' + msUntilPlay.toFixed(0) + ' safeMs=' + safeMs.toFixed(0) + ' startOffset=' + startOffset.toFixed(2), '#ffaa00');
+  dbg('msUntilPlay=' + msUntilPlay.toFixed(0) + 'ms safeMs=' + safeMs.toFixed(0) + 'ms offset=' + startOffset.toFixed(2) + 's', '#ffaa00');
 
-  // KEY TRICK: Instead of setTimeout → play() (blocked by iOS),
-  // we play() NOW at a position slightly BEFORE startOffset,
-  // so that audio naturally reaches startOffset at the right server time.
-  // preRollSeconds = how many seconds before startOffset we start playing (at volume 0)
-  const preRollSeconds = safeMs / 1000;
-  const playFromPosition = Math.max(0, startOffset - preRollSeconds);
+  // Show countdown for fresh plays (not seeks)
+  if (safeMs > 800 && !_suppressNextCountdown) showCountdown(safeMs);
+  _suppressNextCountdown = false;
 
-  pa.volume = 0; // silent during pre-roll
-  pa.currentTime = playFromPosition;
+  // Pre-roll: play silently from (startOffset - preRoll) so audio
+  // naturally arrives at startOffset when safeMs elapses
+  const preRollSecs = Math.min(safeMs / 1000, startOffset); // can't go before 0
+  const playFrom = Math.max(0, startOffset - preRollSecs);
 
-  const playPromise = pa.play();
-  const handlePlay = () => {
-    pa.volume = 1;
-    isPlaying = true;
-    isPaused = false;
-    updatePlayBtn(true);
-    startProgressUpdate();
-    dbg('Audio playing! currentTime=' + pa.currentTime.toFixed(3), '#00ff88');
-  };
+  pa.volume = 0;
+  pa.currentTime = playFrom;
 
-  // At the exact moment startOffset is reached, unmute
-  const checkSync = () => {
-    if (!isPlaying && pa && !pa.paused) {
-      // Schedule unmute at right time
-      const msUntilUnmute = (startOffset - pa.currentTime) * 1000;
-      if (msUntilUnmute <= 50) {
+  function onPlayReady() {
+    if (_playSession !== mySession) { pa.volume = 1; return; } // stale — cancelled
+
+    // Poll every 20ms until we reach startOffset
+    const poll = () => {
+      if (_playSession !== mySession) { pa.volume = 1; return; }
+      if (pa.paused) { pa.volume = 1; return; } // stopped externally
+
+      const msLeft = (startOffset - pa.currentTime) * 1000;
+      if (msLeft <= 30) {
+        // Snap to exact position and unmute
         pa.currentTime = startOffset;
-        handlePlay();
+        pa.volume = 1;
+        isPlaying = true;
+        isPaused = false;
+        updatePlayBtn(true);
+        startProgressUpdate();
+        dbg('▶ Playing! t=' + pa.currentTime.toFixed(3) + ' session=' + mySession, '#00ff88');
       } else {
-        window._playTimer = setTimeout(checkSync, 20);
+        window._playTimer = setTimeout(poll, 15);
       }
-    }
-  };
+    };
+    poll();
+  }
 
-  if (playPromise) {
-    playPromise.then(() => {
-      dbg('play() resolved. currentTime=' + pa.currentTime.toFixed(3) + ' preRoll=' + preRollSeconds.toFixed(2) + 's', '#00ff88');
-      if (preRollSeconds < 0.1) {
-        handlePlay();
-      } else {
-        if (safeMs > 600) showCountdown(safeMs);
-        // Poll until we reach startOffset
-        window._playTimer = setTimeout(checkSync, 20);
-      }
+  const promise = pa.play();
+  if (promise && promise.then) {
+    promise.then(() => {
+      dbg('play() resolved. currentTime=' + pa.currentTime.toFixed(3), '#00ff88');
+      onPlayReady();
     }).catch(e => {
-      dbg('play() failed: ' + e.message, '#ff4444');
+      dbg('play() FAILED: ' + e.message, '#ff4444');
       pa.volume = 1;
     });
   } else {
-    // Old browser — synchronous
-    handlePlay();
+    onPlayReady();
   }
 
   pa.onended = () => {
+    if (_playSession !== mySession) return;
     dbg('Audio ended naturally', '#aaa');
     isPlaying = false; isPaused = false; pausedAtOffset = 0;
     updatePlayBtn(false); stopProgressUpdate(); updateProgress(0);
@@ -852,20 +878,22 @@ function schedulePlay(playAtServerTime, startOffset) {
   playbackStartOffset = startOffset;
 }
 
-function stopPlayback(resetState = true) {
+function stopPlayback(resetPos) {
+  // Invalidate any running play session
+  _playSession++;
   if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
   stopProgressUpdate();
-  if (window.playerAudio) {
-    window.playerAudio.pause();
-    if (resetState) window.playerAudio.currentTime = 0;
+
+  const pa = window.playerAudio;
+  if (pa) {
+    pa.volume = 1; // restore volume before pause
+    pa.pause();
+    if (resetPos) pa.currentTime = 0;
   }
-  if (resetState) {
-    isPlaying = false;
-    isPaused = false;
-    pausedAtOffset = 0;
-  } else {
-    isPlaying = false;
-  }
+
+  isPlaying = false;
+  isPaused = false;
+  if (resetPos) pausedAtOffset = 0;
 }
 
 // =============================================================
