@@ -314,6 +314,7 @@ const SYNC_INTERVAL_MS = 30000; // re-sync every 30s
 let currentFileUrl = null;
 let currentFileUrlName = null;
 let currentFileRevision = 0;
+let currentObjectUrl = null;
 let audioActivated = false;
 let pendingPlayCommand = null;
 
@@ -330,11 +331,12 @@ let syncCorrector = null;
 let _suppressNextCountdown = false;
 let _playSession = 0;
 let _playTimers = [];
+let _audioLoadSession = 0;
 let _countdownInterval = null;
 const ownedAudioElements = new Set();
-const PRE_ROLL_MS = 160;
-const HARD_SYNC_THRESHOLD = 0.18;
-const RATE_SYNC_THRESHOLD = 0.025;
+const PRE_ROLL_MS = 500;
+const INITIAL_SNAP_WINDOW_MS = 1500;
+const INITIAL_SNAP_THRESHOLD = 0.45;
 // Seek drag state
 let isSeeking = false;
 let seekRatio = 0;
@@ -425,6 +427,13 @@ function pauseElement(pa, resetPos, clearSrc) {
   }
 }
 
+function revokeObjectUrl() {
+  if (currentObjectUrl) {
+    try { URL.revokeObjectURL(currentObjectUrl); } catch(e) {}
+    currentObjectUrl = null;
+  }
+}
+
 function hardStopPlayback(options = {}) {
   const resetPos = options.resetPos !== false;
   const clearSrc = options.clearSrc === true;
@@ -454,7 +463,9 @@ function resetProgressUI() {
 
 function clearLocalAudioState(showHostUpload = true) {
   pendingPlayCommand = null;
+  _audioLoadSession++;
   hardStopPlayback({ resetPos: true, clearSrc: true });
+  revokeObjectUrl();
   audioBuffer = null;
   audioDuration = 0;
   currentFileUrl = null;
@@ -809,23 +820,34 @@ async function onFileLoaded(fileName, fileUrl, isNew) {
 
 async function loadAudio(url) {
   dbg('loadAudio start: ' + url, '#0088ff');
+  const loadSession = ++_audioLoadSession;
   cancelPlaybackTimers();
 
   // Tear down previous audio cleanly
   if (window.playerAudio) {
     pauseElement(window.playerAudio, true, true);
   }
+  revokeObjectUrl();
+
+  // Download the whole file first. Playback then runs from a local Blob,
+  // so Railway/network jitter cannot starve the audio decoder mid-song.
+  const response = await fetch(url, { cache: 'no-store' });
+  if (!response.ok) throw new Error('Audio fetch failed ' + response.status);
+  const blob = await response.blob();
+  if (loadSession !== _audioLoadSession) throw new Error('Stale audio load');
+  currentObjectUrl = URL.createObjectURL(blob);
+  dbg('Audio cached locally: ' + (blob.size / 1024 / 1024).toFixed(2) + ' MB', '#00ff88');
 
   const pa = new Audio();
   ownedAudioElements.add(pa);
   window.playerAudio = pa;
   pa.preload = 'auto';
-  pa.src = url;
+  pa.src = currentObjectUrl;
 
   // Step 1: wait for metadata
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      if (window.playerAudio !== pa) return reject(new Error('Stale audio load'));
+      if (window.playerAudio !== pa || loadSession !== _audioLoadSession) return reject(new Error('Stale audio load'));
       if (pa.readyState >= 1) {
         audioDuration = pa.duration || 0;
         dbg('Metadata timeout but readyState ok, duration=' + audioDuration, '#ffaa00');
@@ -837,7 +859,7 @@ async function loadAudio(url) {
 
     pa.addEventListener('loadedmetadata', () => {
       clearTimeout(timeout);
-      if (window.playerAudio !== pa) return reject(new Error('Stale audio metadata'));
+      if (window.playerAudio !== pa || loadSession !== _audioLoadSession) return reject(new Error('Stale audio metadata'));
       audioDuration = pa.duration;
       dbg('Metadata OK. Duration=' + audioDuration.toFixed(1) + 's', '#00ff88');
       resolve();
@@ -872,7 +894,7 @@ async function loadAudio(url) {
     dbg('iOS unlock warn (non-fatal): ' + e.message, '#ffaa00');
   }
 
-  if (window.playerAudio !== pa) throw new Error('Stale audio load');
+  if (window.playerAudio !== pa || loadSession !== _audioLoadSession) throw new Error('Stale audio load');
   audioBuffer = pa; // truthy ready flag
   dbg('loadAudio complete! src=' + pa.src.slice(-15) + ' readyState=' + pa.readyState, '#00ff88');
 }
@@ -1145,6 +1167,9 @@ schedulePlay = function(playAtServerTime, startOffset) {
 
 function startSyncCorrection(pa, sessionId, targetServerTime, startOffset) {
   if (syncCorrector) clearInterval(syncCorrector);
+  const correctionStartedAt = Date.now();
+  let lastDriftLog = 0;
+  let didInitialSnap = false;
   syncCorrector = setInterval(() => {
     if (!isActiveSession(sessionId, pa) || pa.paused || !isPlaying) {
       clearInterval(syncCorrector);
@@ -1159,16 +1184,21 @@ function startSyncCorrection(pa, sessionId, targetServerTime, startOffset) {
     );
     const drift = pa.currentTime - expected;
 
-    if (Math.abs(drift) > HARD_SYNC_THRESHOLD) {
+    // Do not keep seeking/changing rate during playback. It sounds like
+    // stutter on phones. Only one early rescue snap is allowed if the
+    // browser started badly off target; after that playback stability wins.
+    if (!didInitialSnap && Date.now() - correctionStartedAt < INITIAL_SNAP_WINDOW_MS && Math.abs(drift) > INITIAL_SNAP_THRESHOLD) {
+      didInitialSnap = true;
       pa.currentTime = expected;
       pa.playbackRate = 1;
-      dbg('Hard sync correction ' + Math.round(drift * 1000) + 'ms', '#ffaa00');
-    } else if (Math.abs(drift) > RATE_SYNC_THRESHOLD) {
-      pa.playbackRate = clamp(1 - drift * 0.35, 0.96, 1.04);
+      dbg('Initial sync snap ' + Math.round(drift * 1000) + 'ms', '#ffaa00');
+    } else if (Math.abs(drift) > 0.25 && Date.now() - lastDriftLog > 3000) {
+      lastDriftLog = Date.now();
+      dbg('Drift observed ' + Math.round(drift * 1000) + 'ms; not seeking during playback', '#ffaa00');
     } else if (pa.playbackRate !== 1) {
       pa.playbackRate = 1;
     }
-  }, 350);
+  }, 1000);
 }
 
 stopPlayback = function(resetPos) {
