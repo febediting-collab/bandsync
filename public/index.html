@@ -410,6 +410,25 @@ function isActiveSession(sessionId, audioEl) {
   return _playSession === sessionId && (!audioEl || window.playerAudio === audioEl);
 }
 
+function ensurePlayerAudio() {
+  if (window.playerAudio) {
+    ownedAudioElements.add(window.playerAudio);
+    return window.playerAudio;
+  }
+
+  const pa = new Audio();
+  pa.preload = 'auto';
+  pa.playsInline = true;
+  pa.setAttribute('playsinline', '');
+  ownedAudioElements.add(pa);
+  window.playerAudio = pa;
+  return pa;
+}
+
+function mediaElementIsPlaying(pa = window.playerAudio) {
+  return !!(pa && !pa.paused && !pa.ended);
+}
+
 function addPlayTimer(fn, delayMs) {
   const id = setTimeout(() => {
     _playTimers = _playTimers.filter(t => t !== id);
@@ -433,6 +452,7 @@ function pauseElement(pa, resetPos, clearSrc) {
   try { pa.onended = null; } catch(e) {}
   try { pa.pause(); } catch(e) {}
   try { pa.playbackRate = 1; } catch(e) {}
+  try { pa.muted = false; } catch(e) {}
   try { pa.volume = 1; } catch(e) {}
   if (resetPos) {
     try { pa.currentTime = 0; } catch(e) {}
@@ -450,6 +470,50 @@ function revokeObjectUrl() {
   if (currentObjectUrl) {
     try { URL.revokeObjectURL(currentObjectUrl); } catch(e) {}
     currentObjectUrl = null;
+  }
+}
+
+async function unlockPlayerAudio(reason = 'gesture') {
+  const pa = ensurePlayerAudio();
+  if (pa.dataset && pa.dataset.bandsyncUnlocked === '1') return;
+
+  const originalSrc = pa.getAttribute('src');
+  const originalTime = Number.isFinite(pa.currentTime) ? pa.currentTime : 0;
+  const hadRealSrc = !!originalSrc;
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  try {
+    bypassSilentMode();
+
+    if (!hadRealSrc && silentAudio && silentAudio.src) {
+      pa.src = silentAudio.src;
+      try { pa.load(); } catch(e) {}
+    }
+
+    pa.muted = true;
+    pa.volume = 0;
+    try { pa.currentTime = hadRealSrc ? originalTime : 0; } catch(e) {}
+
+    const playPromise = pa.play();
+    if (playPromise && playPromise.catch) playPromise.catch(() => {});
+    await Promise.race([playPromise || Promise.resolve(), delay(120)]);
+
+    if (pa.dataset) pa.dataset.bandsyncUnlocked = '1';
+    dbg('Player audio unlocked via ' + reason, '#00ff88');
+  } catch(e) {
+    dbg('Player unlock warning: ' + e.message, '#ffaa00');
+  } finally {
+    try { pa.pause(); } catch(e) {}
+    try { pa.currentTime = hadRealSrc ? originalTime : 0; } catch(e) {}
+    try { pa.muted = false; } catch(e) {}
+    try { pa.volume = 1; } catch(e) {}
+
+    if (!hadRealSrc) {
+      try {
+        pa.removeAttribute('src');
+        pa.load();
+      } catch(e) {}
+    }
   }
 }
 
@@ -525,6 +589,19 @@ function markCommandSeen(msg) {
   }
 }
 
+function shouldApplyCommand(msg) {
+  if (typeof msg.commandSeq === 'number' && msg.commandSeq < lastCommandSeq) {
+    dbg('Ignored stale command ' + msg.type + ' #' + msg.commandSeq, '#ffaa00');
+    return false;
+  }
+  markCommandSeen(msg);
+  return true;
+}
+
+function hasLocalPlaybackActivity() {
+  return !!(pendingPlayCommand || isPlaying || isPaused || mediaElementIsPlaying());
+}
+
 function applyPauseCommand(pausedOffset, source = 'event') {
   pendingPlayCommand = null;
   pausedAtOffset = Math.max(0, pausedOffset || 0);
@@ -552,8 +629,16 @@ function applyStopCommand(source = 'event') {
 
 function applyAuthoritativeState(snapshot) {
   if (!hasJoined) return;
-  if (typeof snapshot.commandSeq !== 'number' || snapshot.commandSeq <= lastCommandSeq) return;
-  lastCommandSeq = snapshot.commandSeq;
+  if (typeof snapshot.commandSeq !== 'number') return;
+
+  const isNewCommand = snapshot.commandSeq > lastCommandSeq;
+  if (snapshot.commandSeq < lastCommandSeq) return;
+
+  const localActivity = hasLocalPlaybackActivity();
+  if (!isNewCommand && snapshot.isPlaying) return;
+  if (!isNewCommand && !localActivity) return;
+
+  lastCommandSeq = Math.max(lastCommandSeq, snapshot.commandSeq);
   lastSnapshotAppliedAt = Date.now();
 
   const file = snapshot.audioFile;
@@ -572,7 +657,7 @@ function applyAuthoritativeState(snapshot) {
     queuePlay(snapshot.startServerTime, snapshot.startOffset || 0);
   } else if (snapshot.isPaused) {
     applyPauseCommand(snapshot.pausedAtOffset || 0, 'state watchdog');
-  } else if (isPlaying || isPaused || pendingPlayCommand) {
+  } else if (localActivity) {
     applyStopCommand('state watchdog');
   }
 }
@@ -740,7 +825,7 @@ function handleMessage(msg) {
       break;
 
     case 'file_loaded':
-      markCommandSeen(msg);
+      if (!shouldApplyCommand(msg)) break;
       pendingPlayCommand = null;
       _suppressNextCountdown = false;
       hardStopPlayback({ resetPos: true, clearSrc: true });
@@ -753,23 +838,23 @@ function handleMessage(msg) {
       break;
 
     case 'play':
-      markCommandSeen(msg);
+      if (!shouldApplyCommand(msg)) break;
       isPaused = false;
       queuePlay(msg.playAtServerTime, msg.startOffset);
       break;
 
     case 'pause':
-      markCommandSeen(msg);
+      if (!shouldApplyCommand(msg)) break;
       applyPauseCommand(msg.pausedAtOffset || 0);
       break;
 
     case 'stop':
-      markCommandSeen(msg);
+      if (!shouldApplyCommand(msg)) break;
       applyStopCommand();
       break;
 
     case 'audio_cleared':
-      markCommandSeen(msg);
+      if (!shouldApplyCommand(msg)) break;
       clearLocalAudioState(true);
       if (role === 'listener') {
         setListenerStatus('Waiting for host to load a file...', '');
@@ -811,6 +896,8 @@ async function uploadFile(input) {
   }
   const file = input.files[0];
   if (!file) return;
+
+  await unlockPlayerAudio('host upload');
 
   document.getElementById('fileStatus').textContent = 'Uploading...';
   showToast('Uploading...');
@@ -908,10 +995,10 @@ async function loadAudio(url) {
   currentObjectUrl = URL.createObjectURL(blob);
   dbg('Audio cached locally: ' + (blob.size / 1024 / 1024).toFixed(2) + ' MB', '#00ff88');
 
-  const pa = new Audio();
-  ownedAudioElements.add(pa);
-  window.playerAudio = pa;
+  const pa = ensurePlayerAudio();
   pa.preload = 'auto';
+  pa.playsInline = true;
+  pa.setAttribute('playsinline', '');
   pa.src = currentObjectUrl;
 
   // Step 1: wait for metadata
@@ -943,25 +1030,15 @@ async function loadAudio(url) {
     pa.load();
   });
 
-  // Step 2: iOS UNLOCK — play() must be called from user gesture call stack.
-  // We call it NOW during loadAudio which is called from activateAudio (user tap)
-  // or from togglePlay (user tap). Immediately pause after 1ms.
-  // This "unlocks" the audio element for future programmatic play() calls.
+  // Step 2: keep the real track fully stopped after loading.
+  // Unlocking is done only from user gestures via unlockPlayerAudio().
   try {
-    pa.volume = 0;
-    pa.currentTime = 0;
-    await pa.play();
-    if (window.playerAudio !== pa) {
-      pauseElement(pa, true, true);
-      throw new Error('Stale audio unlock');
-    }
     pa.pause();
     pa.currentTime = 0;
+    pa.muted = false;
     pa.volume = 1;
-    dbg('iOS unlock play/pause done', '#00ff88');
   } catch(e) {
-    pa.volume = 1;
-    dbg('iOS unlock warn (non-fatal): ' + e.message, '#ffaa00');
+    dbg('Post-load pause warning: ' + e.message, '#ffaa00');
   }
 
   if (window.playerAudio !== pa || loadSession !== _audioLoadSession) throw new Error('Stale audio load');
@@ -981,12 +1058,13 @@ function resetUpload() {
 // =============================================================
 // PLAYBACK CONTROL (host sends commands)
 // =============================================================
-function togglePlay() {
+async function togglePlay() {
   if (!canControl) { showToast('Only the host can control playback'); return; }
   if (!window.playerAudio || !audioDuration) { showToast('No audio loaded'); return; }
 
   bypassSilentMode();
   requestWakeLock();
+  if (!isPlaying) await unlockPlayerAudio('host play tap');
 
   if (isPlaying) {
     // Pause — get current position from actual audio element
@@ -1180,6 +1258,7 @@ schedulePlay = function(playAtServerTime, startOffset) {
   async function startMuted() {
     if (failIfStale()) return;
     try {
+      pa.muted = true;
       pa.volume = 0;
       pa.playbackRate = 1;
       pa.currentTime = expectedOffset();
@@ -1202,6 +1281,7 @@ schedulePlay = function(playAtServerTime, startOffset) {
         if (promise && promise.catch) promise.catch(e => dbg('resume play() failed: ' + e.message, '#ff4444'));
       }
       if (Math.abs(pa.currentTime - targetOffset) > 0.035) pa.currentTime = targetOffset;
+      pa.muted = false;
       pa.volume = 1;
       pa.playbackRate = 1;
     } catch(e) {
@@ -1391,6 +1471,7 @@ async function activateAudio() {
     send({ type: 'listener_activated' });
 
     bypassSilentMode();
+    await unlockPlayerAudio('listener activation');
     requestWakeLock();
 
     document.getElementById('activateBox').classList.add('hidden');

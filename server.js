@@ -308,6 +308,7 @@ wss.on('connection', (ws) => {
         if (!client.joined || client.role !== 'listener') break;
         client.audioActivated = true;
         broadcastSession();
+        ws.send(JSON.stringify(playbackSnapshot()));
         break;
 
       case 'listener_ready':
@@ -315,6 +316,7 @@ wss.on('connection', (ws) => {
         client.audioReady = true;
         client.audioActivated = true;
         broadcastSession();
+        ws.send(JSON.stringify(playbackSnapshot()));
         break;
 
       case 'play':
