@@ -287,6 +287,8 @@ let hasJoined = false;
 let role = 'host';
 let canControl = false;
 let hostClientId = null;
+let lastCommandSeq = 0;
+let stateWatchdogInterval = null;
 
 // Audio
 let audioCtx = null;
@@ -317,6 +319,7 @@ let currentFileRevision = 0;
 let currentObjectUrl = null;
 let audioActivated = false;
 let pendingPlayCommand = null;
+let lastSnapshotAppliedAt = 0;
 
 // Silent audio for iOS mute bypass
 let silentAudio = null;
@@ -367,11 +370,13 @@ function connect() {
     setStatus('connected', 'Connected');
     dbg('WS connected', '#00ff88');
     startClockSync();
+    startStateWatchdog();
   };
 
   ws.onclose = () => {
     setStatus('disconnected', 'Disconnected — reconnecting...');
     dbg('WS disconnected, retry in 2s', '#ff4444');
+    stopStateWatchdog();
     setTimeout(connect, 2000);
   };
 
@@ -381,6 +386,20 @@ function connect() {
 
 function send(msg) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+function startStateWatchdog() {
+  stopStateWatchdog();
+  stateWatchdogInterval = setInterval(() => {
+    send({ type: 'state_ping', lastCommandSeq });
+  }, 700);
+}
+
+function stopStateWatchdog() {
+  if (stateWatchdogInterval) {
+    clearInterval(stateWatchdogInterval);
+    stateWatchdogInterval = null;
+  }
 }
 
 function clamp(n, min, max) {
@@ -497,6 +516,64 @@ function flushPendingPlay() {
     const cmd = pendingPlayCommand;
     pendingPlayCommand = null;
     schedulePlay(cmd.playAtServerTime, cmd.startOffset);
+  }
+}
+
+function markCommandSeen(msg) {
+  if (typeof msg.commandSeq === 'number') {
+    lastCommandSeq = Math.max(lastCommandSeq, msg.commandSeq);
+  }
+}
+
+function applyPauseCommand(pausedOffset, source = 'event') {
+  pendingPlayCommand = null;
+  pausedAtOffset = Math.max(0, pausedOffset || 0);
+  hardStopPlayback({ resetPos: false, clearSrc: false });
+  isPaused = true;
+  isPlaying = false;
+  if (window.playerAudio) {
+    try { window.playerAudio.currentTime = pausedAtOffset; } catch(e) {}
+  }
+  updatePlayBtn(false);
+  updateProgress(pausedAtOffset);
+  dbg('Paused at ' + pausedAtOffset.toFixed(2) + 's via ' + source, '#ffaa00');
+}
+
+function applyStopCommand(source = 'event') {
+  pendingPlayCommand = null;
+  hardStopPlayback({ resetPos: true, clearSrc: false });
+  isPaused = false;
+  isPlaying = false;
+  pausedAtOffset = 0;
+  updatePlayBtn(false);
+  updateProgress(0);
+  dbg('Stopped via ' + source, '#aaa');
+}
+
+function applyAuthoritativeState(snapshot) {
+  if (!hasJoined) return;
+  if (typeof snapshot.commandSeq !== 'number' || snapshot.commandSeq <= lastCommandSeq) return;
+  lastCommandSeq = snapshot.commandSeq;
+  lastSnapshotAppliedAt = Date.now();
+
+  const file = snapshot.audioFile;
+  if (!file) {
+    clearLocalAudioState(true);
+    return;
+  }
+
+  const nextRevision = file.revision || 0;
+  if (!currentFileUrl || nextRevision !== currentFileRevision) {
+    currentFileRevision = nextRevision;
+    onFileLoaded(file.fileName || 'audio', file.fileUrl, true);
+  }
+
+  if (snapshot.isPlaying && snapshot.startServerTime) {
+    queuePlay(snapshot.startServerTime, snapshot.startOffset || 0);
+  } else if (snapshot.isPaused) {
+    applyPauseCommand(snapshot.pausedAtOffset || 0, 'state watchdog');
+  } else if (isPlaying || isPaused || pendingPlayCommand) {
+    applyStopCommand('state watchdog');
   }
 }
 
@@ -623,6 +700,7 @@ function handleMessage(msg) {
       myClientId = msg.clientId;
       uploadToken = msg.uploadToken || null;
       hostClientId = msg.hostClientId || null;
+      lastCommandSeq = msg.commandSeq || 0;
       updateDeviceCount(msg.sessionCount);
       if (msg.audioFile) {
         currentFileUrl = msg.audioFile.fileUrl;
@@ -650,6 +728,10 @@ function handleMessage(msg) {
       renderDeviceList(msg.clients);
       break;
 
+    case 'state_snapshot':
+      applyAuthoritativeState(msg);
+      break;
+
     case 'role_assigned':
       hostClientId = msg.hostClientId || null;
       applyRole(msg.role, msg.canControl, false);
@@ -658,6 +740,7 @@ function handleMessage(msg) {
       break;
 
     case 'file_loaded':
+      markCommandSeen(msg);
       pendingPlayCommand = null;
       _suppressNextCountdown = false;
       hardStopPlayback({ resetPos: true, clearSrc: true });
@@ -670,36 +753,23 @@ function handleMessage(msg) {
       break;
 
     case 'play':
+      markCommandSeen(msg);
       isPaused = false;
       queuePlay(msg.playAtServerTime, msg.startOffset);
       break;
 
     case 'pause':
-      pendingPlayCommand = null;
-      pausedAtOffset = msg.pausedAtOffset || 0;
-      hardStopPlayback({ resetPos: false, clearSrc: false });
-      isPaused = true;
-      isPlaying = false;
-      if (window.playerAudio) {
-        try { window.playerAudio.currentTime = pausedAtOffset; } catch(e) {}
-      }
-      updatePlayBtn(false);
-      updateProgress(pausedAtOffset);
-      dbg('Paused at ' + pausedAtOffset.toFixed(2) + 's', '#ffaa00');
+      markCommandSeen(msg);
+      applyPauseCommand(msg.pausedAtOffset || 0);
       break;
 
     case 'stop':
-      pendingPlayCommand = null;
-      hardStopPlayback({ resetPos: true, clearSrc: false });
-      isPaused = false;
-      isPlaying = false;
-      pausedAtOffset = 0;
-      updatePlayBtn(false);
-      updateProgress(0);
-      dbg('Stopped', '#aaa');
+      markCommandSeen(msg);
+      applyStopCommand();
       break;
 
     case 'audio_cleared':
+      markCommandSeen(msg);
       clearLocalAudioState(true);
       if (role === 'listener') {
         setListenerStatus('Waiting for host to load a file...', '');

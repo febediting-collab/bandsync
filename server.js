@@ -32,6 +32,7 @@ let audioState = {
   mimeType: null,
   fileName: null,
   revision: 0,
+  commandSeq: 0,
   isPlaying: false,
   isPaused: false,
   startServerTime: null,
@@ -123,6 +124,25 @@ function resetPlaybackState() {
   audioState.pausedAtOffset = 0;
 }
 
+function nextCommandSeq() {
+  audioState.commandSeq++;
+  return audioState.commandSeq;
+}
+
+function playbackSnapshot() {
+  return {
+    type: 'state_snapshot',
+    commandSeq: audioState.commandSeq,
+    audioFile: audioFilePayload(),
+    isPlaying: audioState.isPlaying,
+    isPaused: audioState.isPaused,
+    startServerTime: audioState.startServerTime,
+    startOffset: audioState.startOffset,
+    pausedAtOffset: audioState.pausedAtOffset,
+    serverTime: Date.now(),
+  };
+}
+
 function resetListenerReadyState() {
   clients.forEach(c => {
     if (c.role === 'listener') c.audioReady = false;
@@ -207,12 +227,13 @@ app.post('/upload', upload.single('audio'), (req, res) => {
   audioState.mimeType = req.file.mimetype;
   audioState.fileName = req.file.originalname;
   audioState.revision++;
+  nextCommandSeq();
   resetPlaybackState();
   resetListenerReadyState();
 
   console.log('File loaded by host ' + requester.client.id + ': ' + audioState.fileName + ' (' + (audioState.buffer.length / 1024 / 1024).toFixed(2) + ' MB)');
 
-  broadcast({ type: 'file_loaded', ...audioFilePayload() });
+  broadcast({ type: 'file_loaded', commandSeq: audioState.commandSeq, ...audioFilePayload() });
   broadcastSession();
   res.json({ success: true, ...audioFilePayload() });
 });
@@ -241,6 +262,7 @@ wss.on('connection', (ws) => {
     uploadToken: client.token,
     sessionCount: sessionClients().length,
     hostClientId,
+    commandSeq: audioState.commandSeq,
     audioFile: audioFilePayload(),
     isPlaying: audioState.isPlaying,
     isPaused: audioState.isPaused,
@@ -259,6 +281,10 @@ wss.on('connection', (ws) => {
 
       case 'sync_ping':
         ws.send(JSON.stringify({ type: 'sync_pong', clientSendTime: msg.clientSendTime, serverTime: Date.now() }));
+        break;
+
+      case 'state_ping':
+        ws.send(JSON.stringify(playbackSnapshot()));
         break;
 
       case 'join':
@@ -293,6 +319,7 @@ wss.on('connection', (ws) => {
 
       case 'play':
         if (!isHost(client) || !audioState.buffer) break;
+        nextCommandSeq();
         audioState.isPlaying = true;
         audioState.isPaused = false;
         audioState.startServerTime = Date.now() + PLAY_LEAD_MS;
@@ -300,6 +327,7 @@ wss.on('connection', (ws) => {
         audioState.pausedAtOffset = 0;
         broadcast({
           type: 'play',
+          commandSeq: audioState.commandSeq,
           playAtServerTime: audioState.startServerTime,
           startOffset: audioState.startOffset,
           revision: audioState.revision,
@@ -308,28 +336,31 @@ wss.on('connection', (ws) => {
 
       case 'pause':
         if (!isHost(client)) break;
+        nextCommandSeq();
         audioState.isPlaying = false;
         audioState.isPaused = true;
         audioState.pausedAtOffset = clampOffset(msg.pausedAtOffset);
         audioState.startServerTime = null;
-        broadcast({ type: 'pause', pausedAtOffset: audioState.pausedAtOffset, revision: audioState.revision });
+        broadcast({ type: 'pause', commandSeq: audioState.commandSeq, pausedAtOffset: audioState.pausedAtOffset, revision: audioState.revision });
         break;
 
       case 'stop':
         if (!isHost(client)) break;
+        nextCommandSeq();
         resetPlaybackState();
-        broadcast({ type: 'stop', revision: audioState.revision });
+        broadcast({ type: 'stop', commandSeq: audioState.commandSeq, revision: audioState.revision });
         break;
 
       case 'clear_audio':
         if (!isHost(client)) break;
+        nextCommandSeq();
         audioState.buffer = null;
         audioState.mimeType = null;
         audioState.fileName = null;
         audioState.revision++;
         resetPlaybackState();
         resetListenerReadyState();
-        broadcast({ type: 'audio_cleared', revision: audioState.revision });
+        broadcast({ type: 'audio_cleared', commandSeq: audioState.commandSeq, revision: audioState.revision });
         broadcastSession();
         break;
 
