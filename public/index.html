@@ -1342,10 +1342,15 @@ schedulePlay = function(playAtServerTime, startOffset) {
         const promise = pa.play();
         if (promise && promise.catch) promise.catch(e => dbg('resume play() failed: ' + e.message, '#ff4444'));
       }
-      if (Math.abs(pa.currentTime - targetOffset) > 0.035) pa.currentTime = targetOffset;
+      // Unmute first, then snap — some browsers re-align their internal audio
+      // buffer async after a seek-while-muted, so the snap after unmute is
+      // what actually determines the audible start position.
+      // Always snap unconditionally (no 35ms threshold): audio is fully buffered
+      // as a local Blob so the seek is instant and cannot stall.
       pa.muted = false;
       pa.volume = 1;
       pa.playbackRate = 1;
+      pa.currentTime = targetOffset;
     } catch(e) {
       dbg('Audible start error: ' + e.message, '#ff4444');
       return;
