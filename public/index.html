@@ -484,8 +484,12 @@ function handleMessage(msg) {
       break;
 
     case 'file_loaded':
-      // Cut off any current playback immediately on all devices
+      // Cut off any current playback immediately
       stopPlayback(true);
+      // Reset audio state so device re-loads new file
+      audioBuffer = null;
+      if (window.playerAudio) { window.playerAudio.pause(); window.playerAudio.src = ''; }
+      audioDuration = 0;
       onFileLoaded(msg.fileName, msg.fileUrl, true);
       break;
 
@@ -514,6 +518,12 @@ function handleMessage(msg) {
       updateProgress(0);
       break;
 
+    case 'kicked':
+      stopPlayback(true);
+      document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0a0a0f;color:#ff4444;font-family:Inter,sans-serif;font-size:18px;text-align:center;padding:20px;">You have been removed from this session by the host.</div>';
+      if (ws) ws.close();
+      break;
+
     case 'listener_status':
       renderDeviceList(msg.clients);
       break;
@@ -536,6 +546,16 @@ function switchRole(r) {
 
   // Always send role to server, including current join state
   send({ type: 'set_role', role: r });
+  // Reset local audio state when switching roles
+  if (r === 'listener') {
+    audioActivated = false;
+    audioBuffer = null;
+    audioDuration = 0;
+    if (window.playerAudio) { window.playerAudio.pause(); window.playerAudio.src = ''; }
+    document.getElementById('activateBox').classList.remove('hidden');
+    document.getElementById('listenerReady').classList.add('hidden');
+    setListenerStatus('Tap Activate Audio to join this session.', '');
+  }
   dbg('Role set to: ' + r, '#0088ff');
 }
 
@@ -617,52 +637,66 @@ async function onFileLoaded(fileName, fileUrl, isNew) {
 }
 
 async function loadAudio(url) {
-  dbg('Loading audio: ' + url, '#0088ff');
+  dbg('loadAudio start: ' + url, '#0088ff');
 
-  // Reset playerAudio
+  // Tear down previous audio cleanly
   if (window.playerAudio) {
+    window.playerAudio.onended = null;
     window.playerAudio.pause();
-    window.playerAudio.removeAttribute('src');
+    window.playerAudio.src = '';
     window.playerAudio.load();
   }
 
-  // Create fresh HTMLAudioElement — primary player (works with screen off)
   window.playerAudio = new Audio();
   window.playerAudio.preload = 'auto';
+  window.playerAudio.src = url;
 
-  // Wait for metadata (duration available)
+  // Step 1: wait for metadata
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      dbg('Metadata timeout — trying anyway', '#ffaa00');
       if (window.playerAudio.readyState >= 1) {
         audioDuration = window.playerAudio.duration || 0;
+        dbg('Metadata timeout but readyState ok, duration=' + audioDuration, '#ffaa00');
         resolve();
       } else {
-        reject(new Error('Load timeout'));
+        reject(new Error('Metadata load timeout'));
       }
     }, 20000);
 
     window.playerAudio.addEventListener('loadedmetadata', () => {
       clearTimeout(timeout);
       audioDuration = window.playerAudio.duration;
-      dbg('Metadata OK. Duration: ' + audioDuration.toFixed(1) + 's', '#00ff88');
+      dbg('Metadata OK. Duration=' + audioDuration.toFixed(1) + 's', '#00ff88');
       resolve();
     }, { once: true });
 
     window.playerAudio.addEventListener('error', () => {
       clearTimeout(timeout);
-      const err = window.playerAudio.error;
-      reject(new Error('Audio error code ' + (err ? err.code : '?')));
+      reject(new Error('Audio error ' + (window.playerAudio.error ? window.playerAudio.error.code : '?')));
     }, { once: true });
 
-    window.playerAudio.src = url;
-    dbg('playerAudio.src set to: ' + url, '#0088ff');
     window.playerAudio.load();
   });
 
-  // Mark as ready
-  audioBuffer = window.playerAudio; // truthy flag
-  dbg('playerAudio ready! readyState=' + window.playerAudio.readyState + ' src=' + window.playerAudio.src.slice(-20), '#00ff88');
+  // Step 2: iOS UNLOCK — play() must be called from user gesture call stack.
+  // We call it NOW during loadAudio which is called from activateAudio (user tap)
+  // or from togglePlay (user tap). Immediately pause after 1ms.
+  // This "unlocks" the audio element for future programmatic play() calls.
+  try {
+    window.playerAudio.volume = 0;
+    window.playerAudio.currentTime = 0;
+    await window.playerAudio.play();
+    window.playerAudio.pause();
+    window.playerAudio.currentTime = 0;
+    window.playerAudio.volume = 1;
+    dbg('iOS unlock play/pause done', '#00ff88');
+  } catch(e) {
+    window.playerAudio.volume = 1;
+    dbg('iOS unlock warn (non-fatal): ' + e.message, '#ffaa00');
+  }
+
+  audioBuffer = window.playerAudio; // truthy ready flag
+  dbg('loadAudio complete! src=' + window.playerAudio.src.slice(-15) + ' readyState=' + window.playerAudio.readyState, '#00ff88');
 }
 
 function resetUpload() {
@@ -723,74 +757,99 @@ function getCurrentOffset() {
 
 // =============================================================
 // SCHEDULE PLAY (all devices execute this)
+// Strategy: play() immediately (unlocked from prior user gesture),
+// then use audio.currentTime adjustment for sync instead of setTimeout.
+// This bypasses iOS "not allowed from setTimeout" restriction.
 // =============================================================
 function schedulePlay(playAtServerTime, startOffset) {
-  dbg('schedulePlay. audioBuffer=' + !!audioBuffer + ' playerAudio=' + !!window.playerAudio + ' duration=' + audioDuration + ' src=' + (window.playerAudio ? window.playerAudio.src.slice(-20) : 'none'), '#ffaa00');
+  const pa = window.playerAudio;
+  dbg('schedulePlay. pa=' + !!pa + ' duration=' + audioDuration + ' src=' + (pa ? pa.src.slice(-15) : 'none'), '#ffaa00');
 
-  if (!window.playerAudio || !audioDuration || !window.playerAudio.src || window.playerAudio.src === location.href) {
-    dbg('ABORT: playerAudio not ready. readyState=' + (window.playerAudio ? window.playerAudio.readyState : 'N/A'), '#ff4444');
+  if (!pa || !audioDuration || !pa.src || pa.src === location.href) {
+    dbg('ABORT: playerAudio not ready', '#ff4444');
     return;
   }
 
   bypassSilentMode();
   requestWakeLock();
 
-  // Stop any current playback cleanly
-  stopPlayback(false);
+  // Cancel any pending timer
+  if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
+
+  // Stop current playback
+  pa.pause();
+  isPlaying = false;
+  isPaused = false;
+  stopProgressUpdate();
 
   const nowServer = serverTimeNow();
   const msUntilPlay = playAtServerTime - nowServer;
   const adjustedMs = msUntilPlay - deviceOffsetMs;
-  const safeMs = Math.max(adjustedMs, 100);
+  // safeMs: how far in the future to start. Minimum 50ms.
+  const safeMs = Math.max(adjustedMs, 50);
 
-  dbg('msUntilPlay=' + msUntilPlay.toFixed(0) + 'ms adjusted=' + adjustedMs.toFixed(0) + 'ms safeMs=' + safeMs.toFixed(0) + 'ms', '#ffaa00');
+  dbg('msUntilPlay=' + msUntilPlay.toFixed(0) + ' safeMs=' + safeMs.toFixed(0) + ' startOffset=' + startOffset.toFixed(2), '#ffaa00');
 
-  // Set position
-  window.playerAudio.currentTime = startOffset;
-  playbackStartOffset = startOffset;
+  // KEY TRICK: Instead of setTimeout → play() (blocked by iOS),
+  // we play() NOW at a position slightly BEFORE startOffset,
+  // so that audio naturally reaches startOffset at the right server time.
+  // preRollSeconds = how many seconds before startOffset we start playing (at volume 0)
+  const preRollSeconds = safeMs / 1000;
+  const playFromPosition = Math.max(0, startOffset - preRollSeconds);
 
-  isPlaying = false; // will be set true when play actually starts
-  isPaused = false;
+  pa.volume = 0; // silent during pre-roll
+  pa.currentTime = playFromPosition;
 
-  if (safeMs > 500) showCountdown(safeMs);
-  updatePlayBtn(false); // show paused until it actually starts
-
-  // Schedule play using setTimeout (HTMLAudio doesn't have audioCtx precision,
-  // but safeMs gives enough buffer for smooth sync)
-  const startTimer = setTimeout(() => {
-    if (!window.playerAudio) return;
-    window.playerAudio.currentTime = startOffset; // re-confirm position
-    const playPromise = window.playerAudio.play();
-    if (playPromise) {
-      playPromise.then(() => {
-        isPlaying = true;
-        isPaused = false;
-        updatePlayBtn(true);
-        startProgressUpdate();
-        dbg('HTMLAudio playing! currentTime=' + window.playerAudio.currentTime.toFixed(2), '#00ff88');
-      }).catch(e => {
-        dbg('Play failed: ' + e.message, '#ff4444');
-      });
-    } else {
-      isPlaying = true;
-      updatePlayBtn(true);
-      startProgressUpdate();
-    }
-  }, safeMs);
-
-  // Store timer ref so we can cancel if stop/pause comes before play starts
-  window._playTimer = startTimer;
-
-  // Handle natural end
-  window.playerAudio.onended = () => {
-    dbg('Audio ended naturally', '#aaa');
-    isPlaying = false;
+  const playPromise = pa.play();
+  const handlePlay = () => {
+    pa.volume = 1;
+    isPlaying = true;
     isPaused = false;
-    pausedAtOffset = 0;
-    updatePlayBtn(false);
-    stopProgressUpdate();
-    updateProgress(0);
+    updatePlayBtn(true);
+    startProgressUpdate();
+    dbg('Audio playing! currentTime=' + pa.currentTime.toFixed(3), '#00ff88');
   };
+
+  // At the exact moment startOffset is reached, unmute
+  const checkSync = () => {
+    if (!isPlaying && pa && !pa.paused) {
+      // Schedule unmute at right time
+      const msUntilUnmute = (startOffset - pa.currentTime) * 1000;
+      if (msUntilUnmute <= 50) {
+        pa.currentTime = startOffset;
+        handlePlay();
+      } else {
+        window._playTimer = setTimeout(checkSync, 20);
+      }
+    }
+  };
+
+  if (playPromise) {
+    playPromise.then(() => {
+      dbg('play() resolved. currentTime=' + pa.currentTime.toFixed(3) + ' preRoll=' + preRollSeconds.toFixed(2) + 's', '#00ff88');
+      if (preRollSeconds < 0.1) {
+        handlePlay();
+      } else {
+        if (safeMs > 600) showCountdown(safeMs);
+        // Poll until we reach startOffset
+        window._playTimer = setTimeout(checkSync, 20);
+      }
+    }).catch(e => {
+      dbg('play() failed: ' + e.message, '#ff4444');
+      pa.volume = 1;
+    });
+  } else {
+    // Old browser — synchronous
+    handlePlay();
+  }
+
+  pa.onended = () => {
+    dbg('Audio ended naturally', '#aaa');
+    isPlaying = false; isPaused = false; pausedAtOffset = 0;
+    updatePlayBtn(false); stopProgressUpdate(); updateProgress(0);
+  };
+
+  playbackStartOffset = startOffset;
 }
 
 function stopPlayback(resetState = true) {
@@ -1054,11 +1113,16 @@ function renderDeviceList(clients) {
       if (c.audioReady) {
         statusBadge = '<span class="device-badge badge-ready">Ready</span>';
       } else if (c.audioActivated) {
-        statusBadge = '<span class="device-badge badge-pending">Loading</span>';
+        statusBadge = '<span class="device-badge badge-pending">Loading...</span>';
       } else {
         statusBadge = '<span class="device-badge badge-pending">Not activated</span>';
       }
     }
+
+    // Kick button: only show if I am host and this is not me
+    const kickBtn = (role === 'host' && !isMe)
+      ? `<button onclick="kickDevice(${c.id})" style="margin-left:auto;background:rgba(255,68,68,.12);border:1px solid rgba(255,68,68,.3);color:#ff4444;border-radius:7px;padding:4px 10px;font-size:11px;cursor:pointer;">Remove</button>`
+      : '';
 
     return `
       <div class="device-item ${itemClass}">
@@ -1070,8 +1134,15 @@ function renderDeviceList(clients) {
             ${statusBadge}
           </div>
         </div>
+        ${kickBtn}
       </div>`;
   }).join('');
+}
+
+function kickDevice(clientId) {
+  if (!confirm('Remove this device from the session?')) return;
+  send({ type: 'kick', clientId });
+  dbg('Kicked device ' + clientId, '#ff4444');
 }
 
 function formatTime(secs) {
