@@ -1,6 +1,8 @@
 const crypto = require('crypto');
 const express = require('express');
+const fs = require('fs');
 const http = require('http');
+const path = require('path');
 const WebSocket = require('ws');
 const multer = require('multer');
 
@@ -9,7 +11,16 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const upload = multer({ storage: multer.memoryStorage() });
 
-app.use(express.static('public'));
+const publicDir = path.join(__dirname, 'public');
+const publicIndex = path.join(publicDir, 'index.html');
+const rootIndex = path.join(__dirname, 'index.html');
+
+app.use(express.static(publicDir));
+
+app.get('/', (req, res) => {
+  const indexPath = fs.existsSync(publicIndex) ? publicIndex : rootIndex;
+  res.sendFile(indexPath);
+});
 
 const PLAY_LEAD_MS = 3000;
 
