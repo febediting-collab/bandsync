@@ -168,7 +168,7 @@ app.get('/audio', (req, res) => {
 
   const total = audioState.buffer.length;
   res.set('Accept-Ranges', 'bytes');
-  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.set('Cache-Control', 'private, max-age=3600');
   res.set('Content-Type', audioState.mimeType || 'audio/mpeg');
 
   const range = req.headers.range;
