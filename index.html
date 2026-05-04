@@ -309,7 +309,7 @@ let clockOffset = 0;          // estimated (serverTime - Date.now())
 let rttMs = 0;
 let syncSamples = [];
 let syncRound = 0;
-const SYNC_ROUNDS = 20;          // 20 rounds total; first 4 discarded as warmup → 16 usable
+const SYNC_ROUNDS = 12;
 const SYNC_INTERVAL_MS = 30000; // re-sync every 30s
 
 // Current file
@@ -338,8 +338,8 @@ let _audioLoadSession = 0;
 let _countdownInterval = null;
 const ownedAudioElements = new Set();
 const PRE_ROLL_MS = 500;
-const INITIAL_SNAP_WINDOW_MS = 2000;   // wider window: give slow devices more time to snap
-const INITIAL_SNAP_THRESHOLD = 0.06;   // 60ms — catch drift that was previously ignored
+const INITIAL_SNAP_WINDOW_MS = 1500;
+const INITIAL_SNAP_THRESHOLD = 0.45;
 // Seek drag state
 let isSeeking = false;
 let seekRatio = 0;
@@ -391,11 +391,9 @@ function send(msg) {
 
 function startStateWatchdog() {
   stopStateWatchdog();
-  // 2000ms is sufficient for recovery — 700ms caused unnecessary main-thread
-  // pressure during the critical play-start window on slow mobile devices.
   stateWatchdogInterval = setInterval(() => {
     send({ type: 'state_ping', lastCommandSeq });
-  }, 2000);
+  }, 700);
 }
 
 function stopStateWatchdog() {
@@ -692,10 +690,7 @@ function applyAuthoritativeState(snapshot) {
 }
 
 // =============================================================
-// NTP CLOCK SYNC (20 rounds, discard 4 warmup, best 8 by RTT)
-// More samples + discarding the first few rounds eliminates the
-// bias introduced by DNS, TCP slow-start, and CPU ramp-up that
-// consistently skews the estimate when the user first loads.
+// NTP CLOCK SYNC (12 rounds, best 6 by RTT)
 // =============================================================
 function startClockSync() {
   syncSamples = [];
@@ -713,53 +708,28 @@ function handleSyncPong(msg) {
   const T1 = msg.clientSendTime;
   const T2 = msg.serverTime;
   const rtt = T3 - T1;
-
-  // Asymmetry-aware NTP: standard formula assumes upload==download latency.
-  // We still use it but record both raw rtt and offset so finalizeClock can
-  // weight by RTT (lower RTT = more symmetric = more reliable estimate).
+  // offset: how much to add to Date.now() to get server time
   const offset = (T2 - T1) - rtt / 2;
-
+  syncSamples.push({ rtt, offset });
   syncRound++;
-  // Discard the first 4 rounds (warmup: TCP slow-start, DNS, cold CPU).
-  if (syncRound > 4) {
-    syncSamples.push({ rtt, offset });
-  }
-  setTimeout(doSyncRound, 80);
+  setTimeout(doSyncRound, 60);
 }
 
 function finalizeClock() {
-  if (syncSamples.length === 0) {
-    dbg('Clock sync: no samples, retrying...', '#ffaa00');
-    setTimeout(startClockSync, 2000);
-    return;
-  }
-  // Sort by RTT ascending — low RTT = more symmetric path = better estimate.
+  // Sort by RTT, take best half
   syncSamples.sort((a, b) => a.rtt - b.rtt);
-  // Take best half (at most 8 samples).
-  const takeN = Math.min(8, Math.ceil(syncSamples.length / 2));
-  const best = syncSamples.slice(0, takeN);
-
-  const newOffset = best.reduce((s, x) => s + x.offset, 0) / best.length;
+  const best = syncSamples.slice(0, Math.ceil(SYNC_ROUNDS / 2));
+  clockOffset = best.reduce((s, x) => s + x.offset, 0) / best.length;
   rttMs = best.reduce((s, x) => s + x.rtt, 0) / best.length;
-
-  // Smooth clockOffset updates to avoid sudden jumps during playback.
-  // On the very first sync clockOffset starts at 0, so blend gently.
-  if (syncSamples.length <= takeN) {
-    // First sync — apply directly.
-    clockOffset = newOffset;
-  } else {
-    // Re-sync — blend 30% new / 70% old to avoid step-change during song.
-    clockOffset = clockOffset * 0.7 + newOffset * 0.3;
-  }
 
   document.getElementById('clockOffset').textContent = clockOffset.toFixed(1) + ' ms';
   document.getElementById('networkRTT').textContent = rttMs.toFixed(1) + ' ms';
   const q = rttMs < 10 ? '🟢 Excellent' : rttMs < 30 ? '🟡 Good' : rttMs < 80 ? '🟠 Fair' : '🔴 Poor';
   document.getElementById('syncQuality').textContent = q;
 
-  dbg('Clock sync done. offset=' + clockOffset.toFixed(1) + 'ms RTT=' + rttMs.toFixed(1) + 'ms samples=' + best.length, '#00ff88');
+  dbg('Clock sync done. offset=' + clockOffset.toFixed(1) + 'ms RTT=' + rttMs.toFixed(1) + 'ms', '#00ff88');
 
-  // Re-sync every 30s for drift correction.
+  // Re-sync every 30s for drift correction
   setTimeout(startClockSync, SYNC_INTERVAL_MS);
 }
 
@@ -1197,12 +1167,114 @@ function getCurrentOffset() {
 // A drift corrector keeps late resumes and slow devices aligned.
 // =============================================================
 
-// schedulePlay is defined below as a reassignable var (see "SCHEDULE PLAY" section).
-// The authoritative implementation is the one assigned at runtime further down.
-let schedulePlay = null; // will be assigned below
+function schedulePlay(playAtServerTime, startOffset) {
+  const pa = window.playerAudio;
+  dbg('schedulePlay pa=' + !!pa + ' dur=' + audioDuration.toFixed(1) + ' src=' + (pa ? pa.src.slice(-12) : 'none'), '#ffaa00');
 
-// stopPlayback: authoritative implementation assigned at runtime below.
-let stopPlayback = null;
+  if (!pa || !audioDuration || !pa.src || pa.src === location.href) {
+    dbg('ABORT: playerAudio not ready', '#ff4444');
+    return;
+  }
+
+  bypassSilentMode();
+  requestWakeLock();
+
+  // Cancel any previous play session
+  _playSession++;
+  const mySession = _playSession;
+  if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
+
+  // Hard stop current audio
+  pa.pause();
+  pa.volume = 1;
+  isPlaying = false;
+  isPaused = false;
+  stopProgressUpdate();
+
+  const nowServer = serverTimeNow();
+  const msUntilPlay = playAtServerTime - nowServer;
+  const adjustedMs = msUntilPlay - deviceOffsetMs;
+  const safeMs = Math.max(adjustedMs, 80); // minimum 80ms buffer
+
+  dbg('msUntilPlay=' + msUntilPlay.toFixed(0) + 'ms safeMs=' + safeMs.toFixed(0) + 'ms offset=' + startOffset.toFixed(2) + 's', '#ffaa00');
+
+  // Show countdown for fresh plays (not seeks)
+  if (safeMs > 800 && !_suppressNextCountdown) showCountdown(safeMs);
+  _suppressNextCountdown = false;
+
+  // Pre-roll: play silently from (startOffset - preRoll) so audio
+  // naturally arrives at startOffset when safeMs elapses
+  const preRollSecs = Math.min(safeMs / 1000, startOffset); // can't go before 0
+  const playFrom = Math.max(0, startOffset - preRollSecs);
+
+  pa.volume = 0;
+  pa.currentTime = playFrom;
+
+  function onPlayReady() {
+    if (_playSession !== mySession) { pa.volume = 1; return; } // stale — cancelled
+
+    // Poll every 20ms until we reach startOffset
+    const poll = () => {
+      if (_playSession !== mySession) { pa.volume = 1; return; }
+      if (pa.paused) { pa.volume = 1; return; } // stopped externally
+
+      const msLeft = (startOffset - pa.currentTime) * 1000;
+      if (msLeft <= 30) {
+        // Snap to exact position and unmute
+        pa.currentTime = startOffset;
+        pa.volume = 1;
+        isPlaying = true;
+        isPaused = false;
+        updatePlayBtn(true);
+        startProgressUpdate();
+        dbg('▶ Playing! t=' + pa.currentTime.toFixed(3) + ' session=' + mySession, '#00ff88');
+      } else {
+        window._playTimer = setTimeout(poll, 15);
+      }
+    };
+    poll();
+  }
+
+  const promise = pa.play();
+  if (promise && promise.then) {
+    promise.then(() => {
+      dbg('play() resolved. currentTime=' + pa.currentTime.toFixed(3), '#00ff88');
+      onPlayReady();
+    }).catch(e => {
+      dbg('play() FAILED: ' + e.message, '#ff4444');
+      pa.volume = 1;
+    });
+  } else {
+    onPlayReady();
+  }
+
+  pa.onended = () => {
+    if (_playSession !== mySession) return;
+    dbg('Audio ended naturally', '#aaa');
+    isPlaying = false; isPaused = false; pausedAtOffset = 0;
+    updatePlayBtn(false); stopProgressUpdate(); updateProgress(0);
+  };
+
+  playbackStartOffset = startOffset;
+}
+
+function stopPlayback(resetPos) {
+  // Invalidate any running play session
+  _playSession++;
+  if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
+  stopProgressUpdate();
+
+  const pa = window.playerAudio;
+  if (pa) {
+    pa.volume = 1; // restore volume before pause
+    pa.pause();
+    if (resetPos) pa.currentTime = 0;
+  }
+
+  isPlaying = false;
+  isPaused = false;
+  if (resetPos) pausedAtOffset = 0;
+}
 
 schedulePlay = function(playAtServerTime, startOffset) {
   const pa = window.playerAudio;
@@ -1245,6 +1317,22 @@ schedulePlay = function(playAtServerTime, startOffset) {
   if (leadMs > 800 && !_suppressNextCountdown) showCountdown(leadMs);
   _suppressNextCountdown = false;
 
+  async function startMuted() {
+    if (failIfStale()) return;
+    try {
+      pa.muted = true;
+      pa.volume = 0;
+      pa.playbackRate = 1;
+      pa.currentTime = expectedOffset();
+      const promise = pa.play();
+      if (promise && promise.then) await promise;
+      if (failIfStale()) return;
+      dbg('Muted pre-roll ready at ' + pa.currentTime.toFixed(3), '#00ff88');
+    } catch(e) {
+      dbg('play() FAILED: ' + e.message, '#ff4444');
+    }
+  }
+
   function makeAudible() {
     if (failIfStale()) return;
     const targetOffset = expectedOffset();
@@ -1273,49 +1361,9 @@ schedulePlay = function(playAtServerTime, startOffset) {
     dbg('Playing synced at ' + targetOffset.toFixed(3) + 's session=' + mySession, '#00ff88');
   }
 
-  // KEY FIX: startMuted resolves pa.play() first, then schedules makeAudible
-  // relative to the actual play() resolution time — not a fixed wallclock timer.
-  // This eliminates the iOS race condition where pa.play() took 100-200ms to
-  // resolve but makeAudible() had already fired from a fixed setTimeout.
-  async function startMutedThenSchedule() {
-    if (failIfStale()) return;
-    try {
-      pa.muted = true;
-      pa.volume = 0;
-      pa.playbackRate = 1;
-      pa.currentTime = expectedOffset();
-
-      // Wait for pa.play() to actually resolve before scheduling makeAudible.
-      const playPromise = pa.play();
-      if (playPromise && playPromise.then) await playPromise;
-      if (failIfStale()) return;
-
-      dbg('Muted pre-roll ready at ' + pa.currentTime.toFixed(3), '#00ff88');
-    } catch(e) {
-      dbg('play() FAILED in pre-roll: ' + e.message, '#ff4444');
-      if (failIfStale()) return;
-      // Even if muted pre-roll fails, still attempt makeAudible at target time.
-    }
-
-    // Now that we know pa.play() has resolved (or failed), calculate the
-    // remaining time to the audible target and schedule makeAudible precisely.
-    const remainingMs = targetServerTime - serverTimeNow();
-    if (remainingMs <= 0) {
-      // Already past target time (e.g. slow device, high RTT) — play immediately.
-      dbg('Target time already passed by ' + Math.abs(remainingMs).toFixed(0) + 'ms, playing now', '#ffaa00');
-      makeAudible();
-    } else {
-      addPlayTimer(makeAudible, remainingMs);
-    }
-  }
-
-  if (leadMs > PRE_ROLL_MS) {
-    // Schedule muted pre-roll, then makeAudible will be scheduled inside it.
-    addPlayTimer(() => { startMutedThenSchedule(); }, leadMs - PRE_ROLL_MS);
-  } else {
-    // Not enough lead time for pre-roll — go straight to startMutedThenSchedule.
-    startMutedThenSchedule();
-  }
+  if (leadMs > PRE_ROLL_MS) addPlayTimer(startMuted, leadMs - PRE_ROLL_MS);
+  else startMuted();
+  addPlayTimer(makeAudible, leadMs);
 
   pa.onended = () => {
     if (!isActiveSession(mySession, pa)) return;
