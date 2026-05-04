@@ -23,6 +23,10 @@ app.get('/', (req, res) => {
 });
 
 const PLAY_LEAD_MS = 3000;
+const ALLOWED_AUDIO_EXTENSIONS = new Set([
+  'mp3', 'mpeg', 'mpga', 'wav', 'wave', 'm4a', 'aac', 'flac',
+  'ogg', 'oga', 'opus', 'aif', 'aiff', 'caf', 'mp4', 'm4b', 'webm'
+]);
 
 // ============================================================
 // SERVER STATE
@@ -180,6 +184,14 @@ function clampOffset(offset) {
   return Math.max(0, offset);
 }
 
+function isAllowedAudioUpload(file) {
+  if (!file) return false;
+  const ext = path.extname(file.originalname || '').slice(1).toLowerCase();
+  if (ALLOWED_AUDIO_EXTENSIONS.has(ext)) return true;
+  const mimeType = (file.mimetype || '').toLowerCase();
+  return mimeType.startsWith('audio/') || mimeType === 'video/mp4';
+}
+
 // ============================================================
 // AUDIO ENDPOINTS
 // ============================================================
@@ -222,6 +234,9 @@ app.post('/upload', upload.single('audio'), (req, res) => {
     return res.status(403).json({ success: false, error: 'Only the host can upload audio.' });
   }
   if (!req.file) return res.status(400).json({ success: false, error: 'No file' });
+  if (!isAllowedAudioUpload(req.file)) {
+    return res.status(400).json({ success: false, error: 'Please upload an audio file.' });
+  }
 
   audioState.buffer = req.file.buffer;
   audioState.mimeType = req.file.mimetype;

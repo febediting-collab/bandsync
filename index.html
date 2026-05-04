@@ -86,7 +86,7 @@
 
   /* Progress */
   .progress-wrap { margin:8px 0; }
-  .progress-bar { width:100%; height:6px; background:var(--surface2); border-radius:3px; cursor:pointer; position:relative; }
+  .progress-bar { width:100%; height:6px; background:var(--surface2); border-radius:3px; cursor:pointer; position:relative; touch-action:none; user-select:none; }
   .progress-fill { height:100%; background:linear-gradient(90deg,var(--accent),var(--accent2)); border-radius:3px; width:0%; pointer-events:none; transition:width .1s linear; }
   .progress-handle { position:absolute; top:50%; width:14px; height:14px; background:#fff; border-radius:50%; transform:translate(-50%,-50%); pointer-events:none; box-shadow:0 0 6px rgba(0,0,0,.5); left:0%; }
   .time-row { display:flex; justify-content:space-between; font-family:'Space Mono',monospace; font-size:11px; color:var(--muted); margin-top:6px; }
@@ -177,7 +177,7 @@
     <!-- HOST VIEW -->
     <div id="hostView">
       <div id="uploadZone" class="upload-zone">
-        <input type="file" accept="audio/*" id="fileInput" onchange="uploadFile(this)">
+        <input type="file" id="fileInput" onchange="uploadFile(this)">
         <div class="upload-icon">🎵</div>
         <div class="upload-text">Tap to upload audio file</div>
         <div class="upload-hint">MP3, WAV, AAC, FLAC supported</div>
@@ -194,7 +194,7 @@
       <!-- PLAYER -->
       <div class="player" id="hostPlayer">
         <div class="progress-wrap">
-          <div class="progress-bar" id="progressBar" onmousedown="startSeek(event)" ontouchstart="startSeekTouch(event)">
+          <div class="progress-bar" id="progressBar" onpointerdown="startSeekPointer(event)" onmousedown="if(!window.PointerEvent) startSeek(event)" ontouchstart="if(!window.PointerEvent) startSeekTouch(event)">
             <div class="progress-fill" id="progressFill"></div>
             <div class="progress-handle" id="progressHandle"></div>
           </div>
@@ -343,6 +343,7 @@ const INITIAL_SNAP_THRESHOLD = 0.45;
 // Seek drag state
 let isSeeking = false;
 let seekRatio = 0;
+let seekPreviewUntil = 0;
 
 // =============================================================
 // DEBUG
@@ -603,6 +604,7 @@ function hasLocalPlaybackActivity() {
 }
 
 function applyPauseCommand(pausedOffset, source = 'event') {
+  seekPreviewUntil = 0;
   pendingPlayCommand = null;
   pausedAtOffset = Math.max(0, pausedOffset || 0);
   hardStopPlayback({ resetPos: false, clearSrc: false });
@@ -617,6 +619,7 @@ function applyPauseCommand(pausedOffset, source = 'event') {
 }
 
 function applyStopCommand(source = 'event') {
+  seekPreviewUntil = 0;
   pendingPlayCommand = null;
   hardStopPlayback({ resetPos: true, clearSrc: false });
   isPaused = false;
@@ -885,6 +888,19 @@ function switchRole(r) {
   dbg('Role requested: ' + r, '#0088ff');
 }
 
+const ALLOWED_AUDIO_EXTENSIONS = new Set([
+  'mp3', 'mpeg', 'mpga', 'wav', 'wave', 'm4a', 'aac', 'flac',
+  'ogg', 'oga', 'opus', 'aif', 'aiff', 'caf', 'mp4', 'm4b', 'webm'
+]);
+
+function isAllowedAudioFile(file) {
+  if (!file) return false;
+  const name = (file.name || '').toLowerCase();
+  const ext = name.includes('.') ? name.split('.').pop() : '';
+  if (ALLOWED_AUDIO_EXTENSIONS.has(ext)) return true;
+  return !!file.type && (file.type.startsWith('audio/') || file.type === 'video/mp4');
+}
+
 // =============================================================
 // FILE HANDLING
 // =============================================================
@@ -896,6 +912,12 @@ async function uploadFile(input) {
   }
   const file = input.files[0];
   if (!file) return;
+  if (!isAllowedAudioFile(file)) {
+    showToast('Please choose an audio file');
+    dbg('Rejected non-audio upload: ' + (file.name || file.type || 'unknown'), '#ff4444');
+    input.value = '';
+    return;
+  }
 
   await unlockPlayerAudio('host upload');
 
@@ -1075,8 +1097,9 @@ async function togglePlay() {
     dbg('Sending resume from ' + pausedAtOffset.toFixed(2) + 's', '#ffaa00');
     send({ type: 'play', offset: pausedAtOffset });
   } else {
-    dbg('Sending play from start', '#ffaa00');
-    send({ type: 'play', offset: 0 });
+    const offset = clamp(pausedAtOffset || 0, 0, Math.max(0, audioDuration - 0.05));
+    dbg('Sending play from ' + offset.toFixed(2) + 's', '#ffaa00');
+    send({ type: 'play', offset });
   }
 }
 
@@ -1218,6 +1241,7 @@ function stopPlayback(resetPos) {
 schedulePlay = function(playAtServerTime, startOffset) {
   const pa = window.playerAudio;
   startOffset = Math.max(0, startOffset || 0);
+  seekPreviewUntil = 0;
   dbg('schedulePlay pa=' + !!pa + ' dur=' + audioDuration.toFixed(1) + ' src=' + (pa ? pa.src.slice(-12) : 'none'), '#ffaa00');
 
   if (!pa || !audioDuration || !pa.src || pa.src === location.href) {
@@ -1362,6 +1386,10 @@ function startProgressUpdate() {
   stopProgressUpdate();
   function tick() {
     if (!isPlaying || !window.playerAudio) return;
+    if (isSeeking || Date.now() < seekPreviewUntil) {
+      progressRAF = requestAnimationFrame(tick);
+      return;
+    }
     const elapsed = window.playerAudio.currentTime;
     updateProgress(Math.max(0, Math.min(elapsed, audioDuration)));
     progressRAF = requestAnimationFrame(tick);
@@ -1381,33 +1409,85 @@ function updateProgress(seconds) {
   document.getElementById('currentTime').textContent = formatTime(seconds);
 }
 
-// Seek (mouse)
-function startSeek(e) {
+function beginSeek(clientX, bar) {
   if (!audioDuration) return;
   isSeeking = true;
-  doSeek(e.clientX, e.currentTarget);
+  seekPreviewUntil = 0;
+  doSeek(clientX, bar);
+}
+
+function commitSeek(source = 'seek') {
+  if (!isSeeking) return;
+  isSeeking = false;
+  const offset = clamp(seekRatio * audioDuration, 0, Math.max(0, audioDuration - 0.05));
+  pausedAtOffset = offset;
+  updateProgress(offset);
+
+  if (isPlaying && canControl) {
+    _suppressNextCountdown = true;
+    seekPreviewUntil = Date.now() + 1000;
+    dbg('Seeking while playing to ' + offset.toFixed(2) + 's via ' + source, '#ffaa00');
+    send({ type: 'play', offset });
+  } else {
+    seekPreviewUntil = 0;
+    dbg('Cue position set to ' + offset.toFixed(2) + 's via ' + source, '#ffaa00');
+  }
+}
+
+function startSeekPointer(e) {
+  if (!audioDuration) return;
+  if (e.cancelable) e.preventDefault();
+  beginSeek(e.clientX, e.currentTarget);
+  try { e.currentTarget.setPointerCapture(e.pointerId); } catch(err) {}
+  window.addEventListener('pointermove', onSeekPointerMove);
+  window.addEventListener('pointerup', onSeekPointerEnd);
+  window.addEventListener('pointercancel', onSeekPointerCancel);
+}
+
+function onSeekPointerMove(e) {
+  if (!isSeeking) return;
+  if (e.cancelable) e.preventDefault();
+  doSeek(e.clientX, document.getElementById('progressBar'));
+}
+
+function cleanupPointerSeek() {
+  window.removeEventListener('pointermove', onSeekPointerMove);
+  window.removeEventListener('pointerup', onSeekPointerEnd);
+  window.removeEventListener('pointercancel', onSeekPointerCancel);
+}
+
+function onSeekPointerEnd(e) {
+  if (e && e.cancelable) e.preventDefault();
+  cleanupPointerSeek();
+  commitSeek('pointer');
+}
+
+function onSeekPointerCancel() {
+  cleanupPointerSeek();
+  isSeeking = false;
+}
+
+// Seek (mouse fallback)
+function startSeek(e) {
+  if (!audioDuration) return;
+  if (e.cancelable) e.preventDefault();
+  beginSeek(e.clientX, e.currentTarget);
   window.addEventListener('mousemove', onSeekMove);
   window.addEventListener('mouseup', onSeekEnd);
 }
 
 function onSeekMove(e) {
   if (!isSeeking) return;
+  if (e.cancelable) e.preventDefault();
   doSeek(e.clientX, document.getElementById('progressBar'));
 }
 
 function onSeekEnd(e) {
   if (!isSeeking) return;
-  isSeeking = false;
   window.removeEventListener('mousemove', onSeekMove);
   window.removeEventListener('mouseup', onSeekEnd);
-  const offset = seekRatio * audioDuration;
-  if (isPlaying && canControl) {
-    _suppressNextCountdown = true;
-    send({ type: 'play', offset });
-  } else {
-    pausedAtOffset = offset;
-    updateProgress(offset);
-  }
+  if (e && e.cancelable) e.preventDefault();
+  commitSeek('mouse');
 }
 
 function doSeek(clientX, bar) {
@@ -1419,30 +1499,33 @@ function doSeek(clientX, bar) {
 // Seek (touch)
 function startSeekTouch(e) {
   if (!audioDuration) return;
-  isSeeking = true;
-  doSeek(e.touches[0].clientX, e.currentTarget);
-  window.addEventListener('touchmove', onSeekTouchMove, { passive: true });
+  if (e.cancelable) e.preventDefault();
+  beginSeek(e.touches[0].clientX, e.currentTarget);
+  window.addEventListener('touchmove', onSeekTouchMove, { passive: false });
   window.addEventListener('touchend', onSeekTouchEnd);
+  window.addEventListener('touchcancel', onSeekTouchCancel);
 }
 
 function onSeekTouchMove(e) {
   if (!isSeeking) return;
+  if (e.cancelable) e.preventDefault();
   doSeek(e.touches[0].clientX, document.getElementById('progressBar'));
 }
 
-function onSeekTouchEnd() {
+function onSeekTouchEnd(e) {
   if (!isSeeking) return;
-  isSeeking = false;
   window.removeEventListener('touchmove', onSeekTouchMove);
   window.removeEventListener('touchend', onSeekTouchEnd);
-  const offset = seekRatio * audioDuration;
-  if (isPlaying && canControl) {
-    _suppressNextCountdown = true;
-    send({ type: 'play', offset });
-  } else {
-    pausedAtOffset = offset;
-    updateProgress(offset);
-  }
+  window.removeEventListener('touchcancel', onSeekTouchCancel);
+  if (e && e.cancelable) e.preventDefault();
+  commitSeek('touch');
+}
+
+function onSeekTouchCancel() {
+  window.removeEventListener('touchmove', onSeekTouchMove);
+  window.removeEventListener('touchend', onSeekTouchEnd);
+  window.removeEventListener('touchcancel', onSeekTouchCancel);
+  isSeeking = false;
 }
 
 // =============================================================
