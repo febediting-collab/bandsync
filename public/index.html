@@ -281,9 +281,12 @@
 // =============================================================
 let ws;
 let myClientId = null;
+let uploadToken = null;
 let myName = '';
 let hasJoined = false;
 let role = 'host';
+let canControl = false;
+let hostClientId = null;
 
 // Audio
 let audioCtx = null;
@@ -310,7 +313,9 @@ const SYNC_INTERVAL_MS = 30000; // re-sync every 30s
 // Current file
 let currentFileUrl = null;
 let currentFileUrlName = null;
+let currentFileRevision = 0;
 let audioActivated = false;
+let pendingPlayCommand = null;
 
 // Silent audio for iOS mute bypass
 let silentAudio = null;
@@ -320,8 +325,16 @@ let wakeLock = null;
 
 // Progress RAF
 let progressRAF = null;
+let syncCorrector = null;
 
 let _suppressNextCountdown = false;
+let _playSession = 0;
+let _playTimers = [];
+let _countdownInterval = null;
+const ownedAudioElements = new Set();
+const PRE_ROLL_MS = 160;
+const HARD_SYNC_THRESHOLD = 0.18;
+const RATE_SYNC_THRESHOLD = 0.025;
 // Seek drag state
 let isSeeking = false;
 let seekRatio = 0;
@@ -366,6 +379,114 @@ function connect() {
 
 function send(msg) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function isActiveSession(sessionId, audioEl) {
+  return _playSession === sessionId && (!audioEl || window.playerAudio === audioEl);
+}
+
+function addPlayTimer(fn, delayMs) {
+  const id = setTimeout(() => {
+    _playTimers = _playTimers.filter(t => t !== id);
+    fn();
+  }, Math.max(0, delayMs));
+  _playTimers.push(id);
+  return id;
+}
+
+function cancelPlaybackTimers() {
+  _playSession++;
+  _playTimers.forEach(clearTimeout);
+  _playTimers = [];
+  if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
+  if (syncCorrector) { clearInterval(syncCorrector); syncCorrector = null; }
+  hideCountdown();
+}
+
+function pauseElement(pa, resetPos, clearSrc) {
+  if (!pa) return;
+  try { pa.onended = null; } catch(e) {}
+  try { pa.pause(); } catch(e) {}
+  try { pa.playbackRate = 1; } catch(e) {}
+  try { pa.volume = 1; } catch(e) {}
+  if (resetPos) {
+    try { pa.currentTime = 0; } catch(e) {}
+  }
+  if (clearSrc) {
+    try {
+      pa.removeAttribute('src');
+      pa.load();
+    } catch(e) {}
+    ownedAudioElements.delete(pa);
+  }
+}
+
+function hardStopPlayback(options = {}) {
+  const resetPos = options.resetPos !== false;
+  const clearSrc = options.clearSrc === true;
+  cancelPlaybackTimers();
+  stopProgressUpdate();
+
+  ownedAudioElements.forEach(pa => pauseElement(pa, resetPos, clearSrc));
+  if (window.playerAudio && !ownedAudioElements.has(window.playerAudio)) {
+    pauseElement(window.playerAudio, resetPos, clearSrc);
+  }
+
+  isPlaying = false;
+  isPaused = false;
+  if (resetPos) pausedAtOffset = 0;
+}
+
+function resetProgressUI() {
+  const fill = document.getElementById('progressFill');
+  const handle = document.getElementById('progressHandle');
+  const current = document.getElementById('currentTime');
+  const total = document.getElementById('totalTime');
+  if (fill) fill.style.width = '0%';
+  if (handle) handle.style.left = '0%';
+  if (current) current.textContent = '0:00';
+  if (total) total.textContent = '0:00';
+}
+
+function clearLocalAudioState(showHostUpload = true) {
+  pendingPlayCommand = null;
+  hardStopPlayback({ resetPos: true, clearSrc: true });
+  audioBuffer = null;
+  audioDuration = 0;
+  currentFileUrl = null;
+  currentFileUrlName = null;
+  currentFileRevision = 0;
+  if (showHostUpload) {
+    document.getElementById('uploadZone').style.display = 'block';
+    document.getElementById('fileInfo').classList.add('hidden');
+    document.getElementById('hostPlayer').classList.remove('visible');
+    document.getElementById('fileInput').value = '';
+  }
+  updatePlayBtn(false);
+  resetProgressUI();
+}
+
+function queuePlay(playAtServerTime, startOffset) {
+  pendingPlayCommand = { playAtServerTime, startOffset: startOffset || 0 };
+  if (!audioBuffer) {
+    dbg('Play queued until audio is ready', '#ffaa00');
+    return;
+  }
+  const cmd = pendingPlayCommand;
+  pendingPlayCommand = null;
+  schedulePlay(cmd.playAtServerTime, cmd.startOffset);
+}
+
+function flushPendingPlay() {
+  if (pendingPlayCommand && audioBuffer) {
+    const cmd = pendingPlayCommand;
+    pendingPlayCommand = null;
+    schedulePlay(cmd.playAtServerTime, cmd.startOffset);
+  }
 }
 
 // =============================================================
@@ -416,6 +537,48 @@ function serverTimeNow() {
   return Date.now() + clockOffset;
 }
 
+function applyRole(nextRole, nextCanControl, notifyServer = false) {
+  const previousRole = role;
+  role = nextRole === 'host' ? 'host' : 'listener';
+  canControl = !!nextCanControl;
+
+  document.getElementById('tabHost').classList.toggle('active', role === 'host');
+  document.getElementById('tabListener').classList.toggle('active', role === 'listener');
+  document.getElementById('hostView').classList.toggle('hidden', role !== 'host');
+  document.getElementById('listenerView').classList.toggle('hidden', role !== 'listener');
+
+  if (role === 'host') {
+    audioActivated = true;
+  } else if (previousRole !== 'listener') {
+    audioActivated = false;
+    audioBuffer = null;
+    audioDuration = 0;
+    pendingPlayCommand = null;
+    hardStopPlayback({ resetPos: true, clearSrc: true });
+    document.getElementById('activateBox').classList.remove('hidden');
+    document.getElementById('listenerReady').classList.add('hidden');
+    setListenerStatus('Tap Activate Audio to join this session.', '');
+  }
+
+  updateControlAvailability();
+  renderDeviceList(window._lastClients || []);
+  if (notifyServer) send({ type: 'set_role', role });
+}
+
+function updateControlAvailability() {
+  const hostButtons = document.querySelectorAll('#hostView button, #hostView input[type="file"]');
+  hostButtons.forEach(el => {
+    if (el.id === 'fileInput' || el.id === 'playBtn' || el.classList.contains('ctrl-btn') || el.classList.contains('btn')) {
+      el.disabled = role === 'host' && !canControl;
+    }
+  });
+
+  const status = document.getElementById('fileStatus');
+  if (role === 'host' && !canControl && status) {
+    status.textContent = 'Only the active host can control playback';
+  }
+}
+
 // =============================================================
 // JOIN GATE
 // =============================================================
@@ -435,17 +598,8 @@ function joinSession() {
   document.getElementById('syncCard').classList.remove('hidden');
   document.getElementById('devicesCard').classList.remove('hidden');
 
-  // Host is auto-activated (no mobile restriction on desktop)
-  audioActivated = true;
-
   dbg('Joined as: ' + name, '#00ff88');
   showToast('Welcome, ' + name + '!');
-
-  // If server already has a file loaded (init told us), load it now
-  if (currentFileUrl && audioActivated) {
-    dbg('File already on server, loading now...', '#ffaa00');
-    onFileLoaded(currentFileUrlName || 'audio', currentFileUrl, false);
-  }
 }
 
 // =============================================================
