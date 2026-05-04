@@ -476,11 +476,12 @@ function revokeObjectUrl() {
 
 async function unlockPlayerAudio(reason = 'gesture') {
   const pa = ensurePlayerAudio();
-  if (pa.dataset && pa.dataset.bandsyncUnlocked === '1') return;
 
-  const originalSrc = pa.getAttribute('src');
+  const originalSrc = pa.currentSrc || pa.src || pa.getAttribute('src') || '';
   const originalTime = Number.isFinite(pa.currentTime) ? pa.currentTime : 0;
-  const hadRealSrc = !!originalSrc;
+  const hadRealSrc = !!originalSrc && originalSrc !== location.href;
+  const unlockedKey = hadRealSrc ? originalSrc : '__silent__';
+  if (pa.dataset && pa.dataset.bandsyncUnlockedSrc === unlockedKey) return;
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
   try {
@@ -499,7 +500,10 @@ async function unlockPlayerAudio(reason = 'gesture') {
     if (playPromise && playPromise.catch) playPromise.catch(() => {});
     await Promise.race([playPromise || Promise.resolve(), delay(120)]);
 
-    if (pa.dataset) pa.dataset.bandsyncUnlocked = '1';
+    if (pa.dataset) {
+      pa.dataset.bandsyncUnlocked = '1';
+      pa.dataset.bandsyncUnlockedSrc = unlockedKey;
+    }
     dbg('Player audio unlocked via ' + reason, '#00ff88');
   } catch(e) {
     dbg('Player unlock warning: ' + e.message, '#ffaa00');
@@ -516,6 +520,23 @@ async function unlockPlayerAudio(reason = 'gesture') {
       } catch(e) {}
     }
   }
+}
+
+async function activateLocalAudio(reason = 'audio activation') {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx && audioCtx.state !== 'running') {
+      await audioCtx.resume();
+      dbg('AudioCtx resumed via ' + reason + ': ' + audioCtx.state, '#00ff88');
+    }
+  } catch(e) {
+    dbg('AudioCtx activation warning via ' + reason + ': ' + e.message, '#ffaa00');
+  }
+
+  audioActivated = true;
+  bypassSilentMode();
+  requestWakeLock();
+  await unlockPlayerAudio(reason);
 }
 
 function hardStopPlayback(options = {}) {
@@ -636,6 +657,7 @@ function applyAuthoritativeState(snapshot) {
 
   const isNewCommand = snapshot.commandSeq > lastCommandSeq;
   if (snapshot.commandSeq < lastCommandSeq) return;
+  if (!isNewCommand && (isSeeking || Date.now() < seekPreviewUntil)) return;
 
   const localActivity = hasLocalPlaybackActivity();
   if (!isNewCommand && snapshot.isPlaying) return;
@@ -659,7 +681,9 @@ function applyAuthoritativeState(snapshot) {
   if (snapshot.isPlaying && snapshot.startServerTime) {
     queuePlay(snapshot.startServerTime, snapshot.startOffset || 0);
   } else if (snapshot.isPaused) {
-    applyPauseCommand(snapshot.pausedAtOffset || 0, 'state watchdog');
+    const snapshotOffset = snapshot.pausedAtOffset || 0;
+    const alreadyPausedThere = isPaused && !isPlaying && !pendingPlayCommand && !mediaElementIsPlaying() && Math.abs(pausedAtOffset - snapshotOffset) < 0.05;
+    if (isNewCommand || !alreadyPausedThere) applyPauseCommand(snapshotOffset, 'state watchdog');
   } else if (localActivity) {
     applyStopCommand('state watchdog');
   }
@@ -758,12 +782,13 @@ function updateControlAvailability() {
 // =============================================================
 // JOIN GATE
 // =============================================================
-function joinSession() {
+async function joinSession() {
   const name = document.getElementById('nameInput').value.trim();
   if (!name) { showToast('Enter your name first!'); return; }
   myName = name;
   hasJoined = true;
 
+  if (role === 'host') await activateLocalAudio('host join');
   send({ type: 'join', name, role: 'host' }); // default host, updated when switching
 
   document.getElementById('joinBtn').disabled = true;
@@ -882,8 +907,9 @@ function handleMessage(msg) {
 // =============================================================
 // ROLE SWITCH
 // =============================================================
-function switchRole(r) {
+async function switchRole(r) {
   if (!hasJoined) return;
+  if (r === 'host') await activateLocalAudio('host role tap');
   send({ type: 'set_role', role: r });
   dbg('Role requested: ' + r, '#0088ff');
 }
@@ -919,7 +945,7 @@ async function uploadFile(input) {
     return;
   }
 
-  await unlockPlayerAudio('host upload');
+  await activateLocalAudio('host upload');
 
   document.getElementById('fileStatus').textContent = 'Uploading...';
   showToast('Uploading...');
@@ -1086,7 +1112,7 @@ async function togglePlay() {
 
   bypassSilentMode();
   requestWakeLock();
-  if (!isPlaying) await unlockPlayerAudio('host play tap');
+  if (!isPlaying) await activateLocalAudio('host play tap');
 
   if (isPlaying) {
     // Pause — get current position from actual audio element
@@ -1107,14 +1133,26 @@ function skipBack() {
   if (!canControl) { showToast('Only the host can control playback'); return; }
   const offset = Math.max(0, getCurrentOffset() - 10);
   if (isPlaying) { send({ type: 'play', offset }); }
-  else { pausedAtOffset = offset; updateProgress(offset); }
+  else {
+    pausedAtOffset = offset;
+    isPaused = true;
+    seekPreviewUntil = Date.now() + 5000;
+    updateProgress(offset);
+    send({ type: 'pause', pausedAtOffset: offset });
+  }
 }
 
 function skipForward() {
   if (!canControl) { showToast('Only the host can control playback'); return; }
   const offset = Math.min(audioDuration - 1, getCurrentOffset() + 10);
   if (isPlaying) { send({ type: 'play', offset }); }
-  else { pausedAtOffset = offset; updateProgress(offset); }
+  else {
+    pausedAtOffset = offset;
+    isPaused = true;
+    seekPreviewUntil = Date.now() + 5000;
+    updateProgress(offset);
+    send({ type: 'pause', pausedAtOffset: offset });
+  }
 }
 
 function getCurrentOffset() {
@@ -1425,9 +1463,14 @@ function commitSeek(source = 'seek') {
 
   if (isPlaying && canControl) {
     _suppressNextCountdown = true;
-    seekPreviewUntil = Date.now() + 1000;
+    seekPreviewUntil = Date.now() + 5000;
     dbg('Seeking while playing to ' + offset.toFixed(2) + 's via ' + source, '#ffaa00');
     send({ type: 'play', offset });
+  } else if (canControl) {
+    seekPreviewUntil = Date.now() + 5000;
+    isPaused = true;
+    dbg('Cue position set to ' + offset.toFixed(2) + 's via ' + source, '#ffaa00');
+    send({ type: 'pause', pausedAtOffset: offset });
   } else {
     seekPreviewUntil = 0;
     dbg('Cue position set to ' + offset.toFixed(2) + 's via ' + source, '#ffaa00');
@@ -1543,19 +1586,12 @@ function adjustOffset(deltaMs) {
 // =============================================================
 async function activateAudio() {
   dbg('Activate tapped', '#0088ff');
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
   try {
-    await audioCtx.resume();
-    dbg('AudioCtx resumed: ' + audioCtx.state, '#00ff88');
-    audioActivated = true;
+    await activateLocalAudio('listener activation');
 
     // Notify server immediately so device shows as activated
     send({ type: 'listener_activated' });
-
-    bypassSilentMode();
-    await unlockPlayerAudio('listener activation');
-    requestWakeLock();
 
     document.getElementById('activateBox').classList.add('hidden');
     document.getElementById('listenerReady').classList.remove('hidden');
