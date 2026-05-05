@@ -123,6 +123,12 @@
   .badge-ready { background:rgba(0,255,136,.1); color:var(--accent); border:1px solid rgba(0,255,136,.25); }
   .badge-pending { background:rgba(255,107,53,.1); color:var(--warn); border:1px solid rgba(255,107,53,.25); }
   .badge-you { background:rgba(255,255,255,.08); color:var(--muted); }
+  .badge-latency { background:rgba(0,136,255,.12); color:var(--accent2); border:1px solid rgba(0,136,255,.25); }
+
+  /* Latency calibration status */
+  .cal-status { font-size:11px; color:var(--muted); text-align:center; margin-top:10px; min-height:16px; }
+  .cal-status.ok { color:var(--accent); }
+  .cal-status.warn { color:var(--warn); }
 
   /* Countdown overlay */
   .countdown-overlay { display:none; position:fixed; inset:0; background:rgba(10,10,15,.92); z-index:100; align-items:center; justify-content:center; flex-direction:column; gap:16px; }
@@ -148,7 +154,7 @@
   <div class="header">
     <div class="logo">BandSync</div>
     <div class="tagline">Synchronized Playback for Live Bands</div>
-    <div class="version">v1.2</div>
+    <div class="version">v1.5</div>
   </div>
 
   <!-- CONNECTION CARD -->
@@ -222,9 +228,11 @@
       <!-- Step 2: Ready state -->
       <div class="listener-box hidden" id="listenerReady">
         <div id="listenerStatus" style="font-size:13px;color:var(--muted);">Waiting for host to load a file...</div>
+        <!-- Auto latency calibration status -->
+        <div class="cal-status" id="calStatus"></div>
         <!-- Manual offset calibration -->
         <div style="margin-top:16px;">
-          <div style="font-size:11px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;">Manual Offset Calibration</div>
+          <div style="font-size:11px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;">Manual Fine-Tune (ms)</div>
           <div class="offset-row">
             <button class="offset-btn" onclick="adjustOffset(-10)">−</button>
             <button class="offset-btn" onclick="adjustOffset(-1)">‹</button>
@@ -232,7 +240,7 @@
             <button class="offset-btn" onclick="adjustOffset(1)">›</button>
             <button class="offset-btn" onclick="adjustOffset(10)">+</button>
           </div>
-          <div style="font-size:10px;color:var(--muted);text-align:center;margin-top:6px;">If you hear audio late, decrease offset. If early, increase.</div>
+          <div style="font-size:10px;color:var(--muted);text-align:center;margin-top:6px;">If you hear audio late, decrease. If early, increase.</div>
         </div>
       </div>
     </div>
@@ -244,7 +252,10 @@
     <div class="sync-info"><span class="sync-label">Clock offset (server)</span><span class="sync-value" id="clockOffset">measuring...</span></div>
     <div class="sync-info"><span class="sync-label">Network RTT</span><span class="sync-value" id="networkRTT">—</span></div>
     <div class="sync-info"><span class="sync-label">Sync quality</span><span class="sync-value" id="syncQuality">—</span></div>
-    <div class="sync-info"><span class="sync-label">Device offset</span><span class="sync-value" id="deviceOffsetDisplay">0 ms</span></div>
+    <div class="sync-info"><span class="sync-label">Manual offset</span><span class="sync-value" id="deviceOffsetDisplay">0 ms</span></div>
+    <div class="sync-info"><span class="sync-label">HW latency (auto)</span><span class="sync-value" id="hwLatencyDisplay">—</span></div>
+    <div class="sync-info"><span class="sync-label">Measured latency (auto)</span><span class="sync-value" id="measuredLatencyDisplay">—</span></div>
+    <div class="sync-info"><span class="sync-label">Total compensation</span><span class="sync-value" id="totalCompDisplay">—</span></div>
   </div>
 
   <!-- CONNECTED DEVICES CARD -->
@@ -297,20 +308,32 @@ let audioSource = null;
 let audioDuration = 0;
 let isPlaying = false;
 let isPaused = false;
-let pausedAtOffset = 0;       // track position when paused (seconds)
+let pausedAtOffset = 0;
 let playbackStartAudioCtxTime = null;
 let playbackStartOffset = 0;
 
 // Manual per-device calibration offset (ms, positive = delay listener)
 let deviceOffsetMs = 0;
 
+// ─────────────────────────────────────────────────────────────
+// AUTO LATENCY CALIBRATION
+// autoLatencyMs = hardware floor + measured seek+unmute latency.
+// This is subtracted from targetServerTime so the device starts
+// audio output earlier, compensating for its own pipeline delay.
+// ─────────────────────────────────────────────────────────────
+let autoLatencyMs = 0;
+let autoHwMs = 0;
+let autoMeasuredMs = 0;
+let latencyCalibrated = false;
+let calibrationInProgress = false;
+
 // Clock sync (NTP-style)
-let clockOffset = 0;          // estimated (serverTime - Date.now())
+let clockOffset = 0;
 let rttMs = 0;
 let syncSamples = [];
 let syncRound = 0;
 const SYNC_ROUNDS = 12;
-const SYNC_INTERVAL_MS = 30000; // re-sync every 30s
+const SYNC_INTERVAL_MS = 30000;
 
 // Current file
 let currentFileUrl = null;
@@ -340,6 +363,7 @@ const ownedAudioElements = new Set();
 const PRE_ROLL_MS = 500;
 const INITIAL_SNAP_WINDOW_MS = 1500;
 const INITIAL_SNAP_THRESHOLD = 0.45;
+
 // Seek drag state
 let isSeeking = false;
 let seekRatio = 0;
@@ -416,7 +440,6 @@ function ensurePlayerAudio() {
     ownedAudioElements.add(window.playerAudio);
     return window.playerAudio;
   }
-
   const pa = new Audio();
   pa.preload = 'auto';
   pa.playsInline = true;
@@ -476,7 +499,6 @@ function revokeObjectUrl() {
 
 async function unlockPlayerAudio(reason = 'gesture') {
   const pa = ensurePlayerAudio();
-
   const originalSrc = pa.currentSrc || pa.src || pa.getAttribute('src') || '';
   const originalTime = Number.isFinite(pa.currentTime) ? pa.currentTime : 0;
   const hadRealSrc = !!originalSrc && originalSrc !== location.href;
@@ -486,20 +508,16 @@ async function unlockPlayerAudio(reason = 'gesture') {
 
   try {
     bypassSilentMode();
-
     if (!hadRealSrc && silentAudio && silentAudio.src) {
       pa.src = silentAudio.src;
       try { pa.load(); } catch(e) {}
     }
-
     pa.muted = true;
     pa.volume = 0;
     try { pa.currentTime = hadRealSrc ? originalTime : 0; } catch(e) {}
-
     const playPromise = pa.play();
     if (playPromise && playPromise.catch) playPromise.catch(() => {});
     await Promise.race([playPromise || Promise.resolve(), delay(120)]);
-
     if (pa.dataset) {
       pa.dataset.bandsyncUnlocked = '1';
       pa.dataset.bandsyncUnlockedSrc = unlockedKey;
@@ -512,12 +530,8 @@ async function unlockPlayerAudio(reason = 'gesture') {
     try { pa.currentTime = hadRealSrc ? originalTime : 0; } catch(e) {}
     try { pa.muted = false; } catch(e) {}
     try { pa.volume = 1; } catch(e) {}
-
     if (!hadRealSrc) {
-      try {
-        pa.removeAttribute('src');
-        pa.load();
-      } catch(e) {}
+      try { pa.removeAttribute('src'); pa.load(); } catch(e) {}
     }
   }
 }
@@ -532,7 +546,6 @@ async function activateLocalAudio(reason = 'audio activation') {
   } catch(e) {
     dbg('AudioCtx activation warning via ' + reason + ': ' + e.message, '#ffaa00');
   }
-
   audioActivated = true;
   bypassSilentMode();
   requestWakeLock();
@@ -544,12 +557,10 @@ function hardStopPlayback(options = {}) {
   const clearSrc = options.clearSrc === true;
   cancelPlaybackTimers();
   stopProgressUpdate();
-
   ownedAudioElements.forEach(pa => pauseElement(pa, resetPos, clearSrc));
   if (window.playerAudio && !ownedAudioElements.has(window.playerAudio)) {
     pauseElement(window.playerAudio, resetPos, clearSrc);
   }
-
   isPlaying = false;
   isPaused = false;
   if (resetPos) pausedAtOffset = 0;
@@ -576,6 +587,8 @@ function clearLocalAudioState(showHostUpload = true) {
   currentFileUrl = null;
   currentFileUrlName = null;
   currentFileRevision = 0;
+  latencyCalibrated = false;
+  calibrationInProgress = false;
   if (showHostUpload) {
     document.getElementById('uploadZone').style.display = 'block';
     document.getElementById('fileInfo').classList.add('hidden');
@@ -690,7 +703,7 @@ function applyAuthoritativeState(snapshot) {
 }
 
 // =============================================================
-// NTP CLOCK SYNC (12 rounds, best 6 by RTT)
+// NTP CLOCK SYNC
 // =============================================================
 function startClockSync() {
   syncSamples = [];
@@ -708,7 +721,6 @@ function handleSyncPong(msg) {
   const T1 = msg.clientSendTime;
   const T2 = msg.serverTime;
   const rtt = T3 - T1;
-  // offset: how much to add to Date.now() to get server time
   const offset = (T2 - T1) - rtt / 2;
   syncSamples.push({ rtt, offset });
   syncRound++;
@@ -716,7 +728,6 @@ function handleSyncPong(msg) {
 }
 
 function finalizeClock() {
-  // Sort by RTT, take best half
   syncSamples.sort((a, b) => a.rtt - b.rtt);
   const best = syncSamples.slice(0, Math.ceil(SYNC_ROUNDS / 2));
   clockOffset = best.reduce((s, x) => s + x.offset, 0) / best.length;
@@ -728,8 +739,6 @@ function finalizeClock() {
   document.getElementById('syncQuality').textContent = q;
 
   dbg('Clock sync done. offset=' + clockOffset.toFixed(1) + 'ms RTT=' + rttMs.toFixed(1) + 'ms', '#00ff88');
-
-  // Re-sync every 30s for drift correction
   setTimeout(startClockSync, SYNC_INTERVAL_MS);
 }
 
@@ -737,6 +746,168 @@ function serverTimeNow() {
   return Date.now() + clockOffset;
 }
 
+// =============================================================
+// AUTO LATENCY CALIBRATION
+// Measures seek+unmute latency on the already-playing element
+// (warm-up first), combined with AudioContext hardware latency.
+// =============================================================
+
+/**
+ * Measure the time between pa.currentTime = pos + pa.muted = false
+ * and when pa.currentTime actually advances past that position.
+ * This simulates what makeAudible() does in schedulePlay.
+ * Uses requestAnimationFrame polling for frame-level accuracy.
+ */
+async function measurePlaybackLatency() {
+  const pa = window.playerAudio;
+  if (!pa || audioDuration < 2) {
+    dbg('Latency measure skipped: no audio or too short', '#ffaa00');
+    return 0;
+  }
+
+  dbg('Measuring seek+unmute latency (3 samples)...', '#0088ff');
+
+  // Warm-up: start playing muted so audio engine is hot
+  try {
+    pa.currentTime = 1.0;
+    pa.muted = true;
+    pa.volume = 0;
+    const warmPromise = pa.play();
+    if (warmPromise && warmPromise.catch) warmPromise.catch(() => {});
+    await new Promise(r => setTimeout(r, 350)); // allow engine to warm
+  } catch(e) {
+    dbg('Warm-up failed: ' + e.message, '#ffaa00');
+  }
+
+  const samples = [];
+  const maxTestPos = Math.min(audioDuration - 0.5, 4.0);
+
+  for (let i = 0; i < 3; i++) {
+    // Use different positions to avoid caching effects
+    const testPos = clamp(1.0 + i * 0.5, 0.5, maxTestPos);
+
+    try {
+      // Seek while muted (simulates pre-roll state), then unmute
+      pa.currentTime = testPos;
+      const t0 = performance.now();
+      pa.muted = false;
+
+      // Poll with rAF for frame-accurate detection
+      const latencyMs = await new Promise(resolve => {
+        const deadline = t0 + 600; // max 600ms bail-out
+        const check = () => {
+          const now = performance.now();
+          if (now > deadline) {
+            resolve(250); // fallback: assume 250ms on failure
+            return;
+          }
+          // Check if audio has advanced at least 8ms past testPos
+          if (!pa.paused && pa.currentTime > testPos + 0.008) {
+            resolve(now - t0);
+          } else {
+            requestAnimationFrame(check);
+          }
+        };
+        requestAnimationFrame(check);
+      });
+
+      samples.push(latencyMs);
+      dbg('Latency sample ' + (i+1) + ': ' + latencyMs.toFixed(1) + 'ms', '#aaa');
+
+      // Brief gap between samples
+      pa.muted = true;
+      await new Promise(r => setTimeout(r, 100));
+    } catch(e) {
+      dbg('Latency sample error: ' + e.message, '#ffaa00');
+      samples.push(100); // conservative fallback
+    }
+  }
+
+  // Clean up: stop and reset
+  try {
+    pa.pause();
+    pa.muted = false;
+    pa.volume = 1;
+    pa.currentTime = 0;
+  } catch(e) {}
+
+  // Return median of 3 samples
+  samples.sort((a, b) => a - b);
+  const median = samples[1];
+  dbg('Measured latency median: ' + median.toFixed(1) + 'ms (samples: ' + samples.map(s => s.toFixed(0)).join(', ') + ')', '#0088ff');
+  return median;
+}
+
+/**
+ * Full calibration: combine AudioContext hardware floor latency
+ * with the behavioral seek+unmute measurement. Reports to server.
+ */
+async function calibrateDeviceLatency() {
+  if (calibrationInProgress) return;
+  calibrationInProgress = true;
+  setCalStatus('🔬 Calibrating latency...', '');
+
+  try {
+    // 1. Hardware latency from AudioContext API (zero-cost, accurate)
+    let hwMs = 0;
+    if (audioCtx) {
+      hwMs = ((audioCtx.baseLatency || 0) + (audioCtx.outputLatency || 0)) * 1000;
+      dbg('HW latency from AudioCtx: ' + hwMs.toFixed(1) + 'ms', '#0088ff');
+    }
+
+    // 2. Behavioural: seek+unmute latency measurement
+    const measuredMs = await measurePlaybackLatency();
+
+    // 3. Use the larger of the two (they measure different things)
+    const total = Math.max(hwMs, measuredMs, 0);
+    const capped = Math.min(total, 500); // cap at 500ms sanity ceiling
+
+    autoHwMs = hwMs;
+    autoMeasuredMs = measuredMs;
+    autoLatencyMs = capped;
+    latencyCalibrated = true;
+
+    dbg('Latency calibrated → hw=' + hwMs.toFixed(0) + 'ms measured=' + measuredMs.toFixed(0) + 'ms → using ' + capped.toFixed(0) + 'ms', '#00ff88');
+
+    // Update UI
+    updateLatencyUI();
+    setCalStatus('✅ Auto-calibrated: ' + capped.toFixed(0) + 'ms', 'ok');
+
+    // Report to server for logging/debugging
+    send({
+      type: 'audio_latency_report',
+      latencyMs: capped,
+      hwMs: hwMs,
+      measuredMs: measuredMs,
+    });
+
+  } catch(e) {
+    dbg('Calibration failed: ' + e.message + ' (using 0ms)', '#ffaa00');
+    setCalStatus('⚠️ Calibration failed — manual tune if needed', 'warn');
+  } finally {
+    calibrationInProgress = false;
+  }
+}
+
+function setCalStatus(text, cls) {
+  const el = document.getElementById('calStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'cal-status' + (cls ? ' ' + cls : '');
+}
+
+function updateLatencyUI() {
+  const hw = document.getElementById('hwLatencyDisplay');
+  const meas = document.getElementById('measuredLatencyDisplay');
+  const total = document.getElementById('totalCompDisplay');
+  if (hw) hw.textContent = autoHwMs.toFixed(0) + ' ms';
+  if (meas) meas.textContent = autoMeasuredMs.toFixed(0) + ' ms';
+  if (total) total.textContent = (autoLatencyMs + deviceOffsetMs) + ' ms';
+}
+
+// =============================================================
+// ROLE MANAGEMENT
+// =============================================================
 function applyRole(nextRole, nextCanControl, notifyServer = false) {
   const previousRole = role;
   role = nextRole === 'host' ? 'host' : 'listener';
@@ -754,10 +925,13 @@ function applyRole(nextRole, nextCanControl, notifyServer = false) {
     audioBuffer = null;
     audioDuration = 0;
     pendingPlayCommand = null;
+    latencyCalibrated = false;
+    calibrationInProgress = false;
     hardStopPlayback({ resetPos: true, clearSrc: true });
     document.getElementById('activateBox').classList.remove('hidden');
     document.getElementById('listenerReady').classList.add('hidden');
     setListenerStatus('Tap Activate Audio to join this session.', '');
+    setCalStatus('', '');
   }
 
   updateControlAvailability();
@@ -772,7 +946,6 @@ function updateControlAvailability() {
       el.disabled = role === 'host' && !canControl;
     }
   });
-
   const status = document.getElementById('fileStatus');
   if (role === 'host' && !canControl && status) {
     status.textContent = 'Only the active host can control playback';
@@ -789,7 +962,7 @@ async function joinSession() {
   hasJoined = true;
 
   if (role === 'host') await activateLocalAudio('host join');
-  send({ type: 'join', name, role: 'host' }); // default host, updated when switching
+  send({ type: 'join', name, role: 'host' });
 
   document.getElementById('joinBtn').disabled = true;
   document.getElementById('nameInput').disabled = true;
@@ -860,6 +1033,8 @@ function handleMessage(msg) {
       audioBuffer = null;
       audioDuration = 0;
       currentFileRevision = msg.revision || currentFileRevision + 1;
+      latencyCalibrated = false;      // re-calibrate on new file
+      calibrationInProgress = false;
       updatePlayBtn(false);
       resetProgressUI();
       onFileLoaded(msg.fileName, msg.fileUrl, true);
@@ -890,6 +1065,14 @@ function handleMessage(msg) {
         document.getElementById('listenerReady').classList.toggle('hidden', !audioActivated);
       }
       dbg('Audio cleared by host', '#ffaa00');
+      break;
+
+    // --------------------------------------------------------
+    // NEW: Server acks our latency report — update UI
+    // --------------------------------------------------------
+    case 'latency_ack':
+      dbg('Latency ack from server: ' + msg.latencyMs + 'ms', '#0088ff');
+      updateLatencyUI();
       break;
 
     case 'kicked':
@@ -976,7 +1159,6 @@ async function onFileLoaded(fileName, fileUrl, isNew) {
   currentFileUrl = fileUrl;
   currentFileUrlName = fileName;
 
-  // Update host UI
   document.getElementById('fileName').textContent = fileName;
   document.getElementById('fileInfo').classList.remove('hidden');
   document.getElementById('uploadZone').style.display = 'none';
@@ -984,7 +1166,6 @@ async function onFileLoaded(fileName, fileUrl, isNew) {
   document.getElementById('fileStatus').textContent = 'Ready to broadcast';
   updateControlAvailability();
 
-  // Reset player state if new file
   if (isNew) {
     isPaused = false;
     pausedAtOffset = 0;
@@ -994,7 +1175,6 @@ async function onFileLoaded(fileName, fileUrl, isNew) {
     audioBuffer = null;
   }
 
-  // Update listener status
   if (role === 'listener') {
     if (!audioActivated) {
       setListenerStatus('🎵 File received — tap Activate Audio first', '#ffaa00');
@@ -1003,7 +1183,6 @@ async function onFileLoaded(fileName, fileUrl, isNew) {
     setListenerStatus('<span class="spinner"></span> Loading audio...', '');
   }
 
-  // Load audio — always load for host, only if activated for listener
   const shouldLoad = (role === 'host') || audioActivated;
   if (shouldLoad) {
     try {
@@ -1013,8 +1192,22 @@ async function onFileLoaded(fileName, fileUrl, isNew) {
       document.getElementById('totalTime').textContent = formatTime(audioDuration);
       dbg('Audio ready! Duration: ' + audioDuration.toFixed(1) + 's role=' + role, '#00ff88');
 
-      // Tell server this listener is ready
-      if (role === 'listener') send({ type: 'listener_ready' });
+      if (role === 'listener') {
+        send({ type: 'listener_ready' });
+
+        // Calibrate latency after audio is ready.
+        // Small delay ensures flushPendingPlay runs first.
+        if (!latencyCalibrated && !calibrationInProgress) {
+          setTimeout(async () => {
+            try {
+              await calibrateDeviceLatency();
+            } catch(e) {
+              dbg('Latency calibration error: ' + e.message, '#ffaa00');
+            }
+          }, 500);
+        }
+      }
+
       flushPendingPlay();
     } catch (e) {
       dbg('loadAudio error: ' + e.message, '#ff4444');
@@ -1028,14 +1221,11 @@ async function loadAudio(url) {
   const loadSession = ++_audioLoadSession;
   cancelPlaybackTimers();
 
-  // Tear down previous audio cleanly
   if (window.playerAudio) {
     pauseElement(window.playerAudio, true, true);
   }
   revokeObjectUrl();
 
-  // Download the whole file first. Playback then runs from a local Blob,
-  // so Railway/network jitter cannot starve the audio decoder mid-song.
   const response = await fetch(url, { cache: 'no-store' });
   if (!response.ok) throw new Error('Audio fetch failed ' + response.status);
   const blob = await response.blob();
@@ -1049,7 +1239,6 @@ async function loadAudio(url) {
   pa.setAttribute('playsinline', '');
   pa.src = currentObjectUrl;
 
-  // Step 1: wait for metadata
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       if (window.playerAudio !== pa || loadSession !== _audioLoadSession) return reject(new Error('Stale audio load'));
@@ -1078,8 +1267,6 @@ async function loadAudio(url) {
     pa.load();
   });
 
-  // Step 2: keep the real track fully stopped after loading.
-  // Unlocking is done only from user gestures via unlockPlayerAudio().
   try {
     pa.pause();
     pa.currentTime = 0;
@@ -1090,7 +1277,7 @@ async function loadAudio(url) {
   }
 
   if (window.playerAudio !== pa || loadSession !== _audioLoadSession) throw new Error('Stale audio load');
-  audioBuffer = pa; // truthy ready flag
+  audioBuffer = pa;
   dbg('loadAudio complete! src=' + pa.src.slice(-15) + ' readyState=' + pa.readyState, '#00ff88');
 }
 
@@ -1115,7 +1302,6 @@ async function togglePlay() {
   if (!isPlaying) await activateLocalAudio('host play tap');
 
   if (isPlaying) {
-    // Pause — get current position from actual audio element
     const pos = window.playerAudio ? window.playerAudio.currentTime : pausedAtOffset;
     dbg('Sending pause at ' + pos.toFixed(2) + 's', '#ffaa00');
     send({ type: 'pause', pausedAtOffset: pos });
@@ -1161,122 +1347,20 @@ function getCurrentOffset() {
 }
 
 // =============================================================
-// SCHEDULE PLAY
-// Server time is the source of truth. The element may start muted
-// shortly before the target, then snaps/unmutes on the server target.
-// A drift corrector keeps late resumes and slow devices aligned.
+// SCHEDULE PLAY — CLIENT-SIDE LATENCY COMPENSATION
+//
+// Server broadcasts ONE playAtServerTime to all devices.
+// Each client subtracts its own autoLatencyMs so it starts
+// audio output early enough that the sound physically exits
+// the speaker at the correct moment.
+//
+// Formula:
+//   effectiveTarget = playAtServerTime - autoLatencyMs + deviceOffsetMs
+//
+// autoLatencyMs < 0 is clamped to 0 (never delay further).
+// deviceOffsetMs is the manual fine-tune (positive = add delay).
 // =============================================================
-
 function schedulePlay(playAtServerTime, startOffset) {
-  const pa = window.playerAudio;
-  dbg('schedulePlay pa=' + !!pa + ' dur=' + audioDuration.toFixed(1) + ' src=' + (pa ? pa.src.slice(-12) : 'none'), '#ffaa00');
-
-  if (!pa || !audioDuration || !pa.src || pa.src === location.href) {
-    dbg('ABORT: playerAudio not ready', '#ff4444');
-    return;
-  }
-
-  bypassSilentMode();
-  requestWakeLock();
-
-  // Cancel any previous play session
-  _playSession++;
-  const mySession = _playSession;
-  if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
-
-  // Hard stop current audio
-  pa.pause();
-  pa.volume = 1;
-  isPlaying = false;
-  isPaused = false;
-  stopProgressUpdate();
-
-  const nowServer = serverTimeNow();
-  const msUntilPlay = playAtServerTime - nowServer;
-  const adjustedMs = msUntilPlay - deviceOffsetMs;
-  const safeMs = Math.max(adjustedMs, 80); // minimum 80ms buffer
-
-  dbg('msUntilPlay=' + msUntilPlay.toFixed(0) + 'ms safeMs=' + safeMs.toFixed(0) + 'ms offset=' + startOffset.toFixed(2) + 's', '#ffaa00');
-
-  // Show countdown for fresh plays (not seeks)
-  if (safeMs > 800 && !_suppressNextCountdown) showCountdown(safeMs);
-  _suppressNextCountdown = false;
-
-  // Pre-roll: play silently from (startOffset - preRoll) so audio
-  // naturally arrives at startOffset when safeMs elapses
-  const preRollSecs = Math.min(safeMs / 1000, startOffset); // can't go before 0
-  const playFrom = Math.max(0, startOffset - preRollSecs);
-
-  pa.volume = 0;
-  pa.currentTime = playFrom;
-
-  function onPlayReady() {
-    if (_playSession !== mySession) { pa.volume = 1; return; } // stale — cancelled
-
-    // Poll every 20ms until we reach startOffset
-    const poll = () => {
-      if (_playSession !== mySession) { pa.volume = 1; return; }
-      if (pa.paused) { pa.volume = 1; return; } // stopped externally
-
-      const msLeft = (startOffset - pa.currentTime) * 1000;
-      if (msLeft <= 30) {
-        // Snap to exact position and unmute
-        pa.currentTime = startOffset;
-        pa.volume = 1;
-        isPlaying = true;
-        isPaused = false;
-        updatePlayBtn(true);
-        startProgressUpdate();
-        dbg('▶ Playing! t=' + pa.currentTime.toFixed(3) + ' session=' + mySession, '#00ff88');
-      } else {
-        window._playTimer = setTimeout(poll, 15);
-      }
-    };
-    poll();
-  }
-
-  const promise = pa.play();
-  if (promise && promise.then) {
-    promise.then(() => {
-      dbg('play() resolved. currentTime=' + pa.currentTime.toFixed(3), '#00ff88');
-      onPlayReady();
-    }).catch(e => {
-      dbg('play() FAILED: ' + e.message, '#ff4444');
-      pa.volume = 1;
-    });
-  } else {
-    onPlayReady();
-  }
-
-  pa.onended = () => {
-    if (_playSession !== mySession) return;
-    dbg('Audio ended naturally', '#aaa');
-    isPlaying = false; isPaused = false; pausedAtOffset = 0;
-    updatePlayBtn(false); stopProgressUpdate(); updateProgress(0);
-  };
-
-  playbackStartOffset = startOffset;
-}
-
-function stopPlayback(resetPos) {
-  // Invalidate any running play session
-  _playSession++;
-  if (window._playTimer) { clearTimeout(window._playTimer); window._playTimer = null; }
-  stopProgressUpdate();
-
-  const pa = window.playerAudio;
-  if (pa) {
-    pa.volume = 1; // restore volume before pause
-    pa.pause();
-    if (resetPos) pa.currentTime = 0;
-  }
-
-  isPlaying = false;
-  isPaused = false;
-  if (resetPos) pausedAtOffset = 0;
-}
-
-schedulePlay = function(playAtServerTime, startOffset) {
   const pa = window.playerAudio;
   startOffset = Math.max(0, startOffset || 0);
   seekPreviewUntil = 0;
@@ -1293,7 +1377,20 @@ schedulePlay = function(playAtServerTime, startOffset) {
   cancelPlaybackTimers();
 
   const mySession = _playSession;
-  const targetServerTime = playAtServerTime + deviceOffsetMs;
+
+  // ─── Core compensation: start early by autoLatencyMs ───────
+  // autoLatencyMs = HW pipeline delay + seek+unmute response time.
+  // We subtract it so the device fires its audio pipeline sooner,
+  // meaning audible output arrives at playAtServerTime.
+  // deviceOffsetMs is a manual trim on top (positive = later).
+  const latencyComp = Math.max(0, autoLatencyMs);       // never negative
+  const effectiveTargetServerTime = playAtServerTime - latencyComp + deviceOffsetMs;
+
+  dbg(
+    'Compensation: auto=' + latencyComp.toFixed(0) + 'ms manual=' + deviceOffsetMs + 'ms' +
+    ' → effective target -' + (latencyComp - deviceOffsetMs).toFixed(0) + 'ms',
+    '#0088ff'
+  );
 
   pauseElement(pa, false, false);
   isPlaying = false;
@@ -1301,7 +1398,8 @@ schedulePlay = function(playAtServerTime, startOffset) {
   stopProgressUpdate();
 
   function expectedOffset(extraMs = 0) {
-    const elapsed = Math.max(0, (serverTimeNow() + extraMs - targetServerTime) / 1000);
+    // How far into the track should we be at (serverTimeNow + extraMs)?
+    const elapsed = Math.max(0, (serverTimeNow() + extraMs - playAtServerTime) / 1000);
     return clamp(startOffset + elapsed, 0, Math.max(0, audioDuration - 0.05));
   }
 
@@ -1311,8 +1409,9 @@ schedulePlay = function(playAtServerTime, startOffset) {
     return true;
   }
 
-  const leadMs = targetServerTime - serverTimeNow();
-  dbg('leadMs=' + leadMs.toFixed(0) + 'ms offset=' + startOffset.toFixed(2) + 's deviceOffset=' + deviceOffsetMs + 'ms', '#ffaa00');
+  // leadMs is relative to the effective (compensated) target
+  const leadMs = effectiveTargetServerTime - serverTimeNow();
+  dbg('leadMs=' + leadMs.toFixed(0) + 'ms startOffset=' + startOffset.toFixed(2) + 's', '#ffaa00');
 
   if (leadMs > 800 && !_suppressNextCountdown) showCountdown(leadMs);
   _suppressNextCountdown = false;
@@ -1335,6 +1434,8 @@ schedulePlay = function(playAtServerTime, startOffset) {
 
   function makeAudible() {
     if (failIfStale()) return;
+    // targetOffset uses playAtServerTime (not effectiveTarget) so the
+    // track position is accurate regardless of compensation math
     const targetOffset = expectedOffset();
     try {
       if (pa.paused) {
@@ -1342,11 +1443,6 @@ schedulePlay = function(playAtServerTime, startOffset) {
         const promise = pa.play();
         if (promise && promise.catch) promise.catch(e => dbg('resume play() failed: ' + e.message, '#ff4444'));
       }
-      // Unmute first, then snap — some browsers re-align their internal audio
-      // buffer async after a seek-while-muted, so the snap after unmute is
-      // what actually determines the audible start position.
-      // Always snap unconditionally (no 35ms threshold): audio is fully buffered
-      // as a local Blob so the seek is instant and cannot stall.
       pa.muted = false;
       pa.volume = 1;
       pa.playbackRate = 1;
@@ -1362,7 +1458,7 @@ schedulePlay = function(playAtServerTime, startOffset) {
     updatePlayBtn(true);
     updateProgress(targetOffset);
     startProgressUpdate();
-    startSyncCorrection(pa, mySession, targetServerTime, startOffset);
+    startSyncCorrection(pa, mySession, playAtServerTime, startOffset);
     dbg('Playing synced at ' + targetOffset.toFixed(3) + 's session=' + mySession, '#00ff88');
   }
 
@@ -1376,11 +1472,12 @@ schedulePlay = function(playAtServerTime, startOffset) {
     isPlaying = false;
     isPaused = false;
     pausedAtOffset = 0;
+    latencyCalibrated = false; // allow re-calibration next play
     updatePlayBtn(false);
     stopProgressUpdate();
     updateProgress(0);
   };
-};
+}
 
 function startSyncCorrection(pa, sessionId, targetServerTime, startOffset) {
   if (syncCorrector) clearInterval(syncCorrector);
@@ -1401,9 +1498,6 @@ function startSyncCorrection(pa, sessionId, targetServerTime, startOffset) {
     );
     const drift = pa.currentTime - expected;
 
-    // Do not keep seeking/changing rate during playback. It sounds like
-    // stutter on phones. Only one early rescue snap is allowed if the
-    // browser started badly off target; after that playback stability wins.
     if (!didInitialSnap && Date.now() - correctionStartedAt < INITIAL_SNAP_WINDOW_MS && Math.abs(drift) > INITIAL_SNAP_THRESHOLD) {
       didInitialSnap = true;
       pa.currentTime = expected;
@@ -1418,9 +1512,9 @@ function startSyncCorrection(pa, sessionId, targetServerTime, startOffset) {
   }, 1000);
 }
 
-stopPlayback = function(resetPos) {
+function stopPlayback(resetPos) {
   hardStopPlayback({ resetPos: resetPos !== false, clearSrc: false });
-};
+}
 
 // =============================================================
 // PROGRESS BAR
@@ -1515,7 +1609,6 @@ function onSeekPointerCancel() {
   isSeeking = false;
 }
 
-// Seek (mouse fallback)
 function startSeek(e) {
   if (!audioDuration) return;
   if (e.cancelable) e.preventDefault();
@@ -1544,7 +1637,6 @@ function doSeek(clientX, bar) {
   updateProgress(seekRatio * audioDuration);
 }
 
-// Seek (touch)
 function startSeekTouch(e) {
   if (!audioDuration) return;
   if (e.cancelable) e.preventDefault();
@@ -1583,7 +1675,8 @@ function adjustOffset(deltaMs) {
   deviceOffsetMs += deltaMs;
   document.getElementById('offsetDisplay').textContent = deviceOffsetMs + ' ms';
   document.getElementById('deviceOffsetDisplay').textContent = deviceOffsetMs + ' ms';
-  dbg('Device offset: ' + deviceOffsetMs + 'ms', '#0088ff');
+  updateLatencyUI();
+  dbg('Manual offset: ' + deviceOffsetMs + 'ms  total comp: ' + (autoLatencyMs + deviceOffsetMs) + 'ms', '#0088ff');
 }
 
 // =============================================================
@@ -1591,11 +1684,8 @@ function adjustOffset(deltaMs) {
 // =============================================================
 async function activateAudio() {
   dbg('Activate tapped', '#0088ff');
-
   try {
     await activateLocalAudio('listener activation');
-
-    // Notify server immediately so device shows as activated
     send({ type: 'listener_activated' });
 
     document.getElementById('activateBox').classList.add('hidden');
@@ -1608,6 +1698,17 @@ async function activateAudio() {
         setListenerStatus('✅ File loaded & ready — waiting for host', '#00ff88');
         document.getElementById('totalTime').textContent = formatTime(audioDuration);
         send({ type: 'listener_ready' });
+
+        // Calibrate latency now that audio is ready
+        if (!latencyCalibrated && !calibrationInProgress) {
+          setTimeout(async () => {
+            try {
+              await calibrateDeviceLatency();
+            } catch(e) {
+              dbg('Latency calibration error: ' + e.message, '#ffaa00');
+            }
+          }, 500);
+        }
       } catch(e) {
         setListenerStatus('❌ Error loading: ' + e.message, '#ff4444');
         dbg('Load error: ' + e.message, '#ff4444');
@@ -1649,9 +1750,7 @@ async function requestWakeLock() {
     if ('wakeLock' in navigator) {
       wakeLock = await navigator.wakeLock.request('screen');
       dbg('Wake lock acquired', '#00ff88');
-      wakeLock.addEventListener('release', () => {
-        dbg('Wake lock released', '#ffaa00');
-      });
+      wakeLock.addEventListener('release', () => dbg('Wake lock released', '#ffaa00'));
     }
   } catch(e) { dbg('Wake lock fail: ' + e.message, '#ffaa00'); }
 }
@@ -1681,7 +1780,7 @@ function showCountdown(msUntilPlay) {
       hideCountdown();
     } else {
       num.style.animation = 'none';
-      num.offsetHeight; // reflow
+      num.offsetHeight;
       num.style.animation = '';
       num.textContent = remaining;
     }
@@ -1740,7 +1839,11 @@ function renderDeviceList(clients) {
       }
     }
 
-    // Kick button: only show for the server-authorized host
+    // Show auto-measured latency badge for listeners
+    const latencyBadge = (!isHost && c.audioLatencyMs !== null && c.audioLatencyMs !== undefined)
+      ? `<span class="device-badge badge-latency">~${c.audioLatencyMs}ms</span>`
+      : '';
+
     const kickBtn = (canControl && !isMe)
       ? `<button onclick="kickDevice(${c.id})" style="margin-left:auto;background:rgba(255,68,68,.12);border:1px solid rgba(255,68,68,.3);color:#ff4444;border-radius:7px;padding:4px 10px;font-size:11px;cursor:pointer;">Remove</button>`
       : '';
@@ -1753,6 +1856,7 @@ function renderDeviceList(clients) {
           <div class="device-meta">
             <span class="device-badge ${isHost ? 'badge-host' : 'badge-listener'}">${isHost ? 'Host' : 'Listener'}</span>
             ${statusBadge}
+            ${latencyBadge}
           </div>
         </div>
         ${kickBtn}
