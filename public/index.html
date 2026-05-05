@@ -154,7 +154,7 @@
   <div class="header">
     <div class="logo">BandSync</div>
     <div class="tagline">Synchronized Playback for Live Bands</div>
-    <div class="version">v1.5</div>
+    <div class="version">v1.6</div>
   </div>
 
   <!-- CONNECTION CARD -->
@@ -240,7 +240,7 @@
             <button class="offset-btn" onclick="adjustOffset(1)">›</button>
             <button class="offset-btn" onclick="adjustOffset(10)">+</button>
           </div>
-          <div style="font-size:10px;color:var(--muted);text-align:center;margin-top:6px;">If you hear audio late, decrease. If early, increase.</div>
+          <div style="font-size:10px;color:var(--muted);text-align:center;margin-top:6px;">If you hear audio late, increase (positive). If early, decrease (negative). Only needed for Bluetooth/special cases.</div>
         </div>
       </div>
     </div>
@@ -253,9 +253,9 @@
     <div class="sync-info"><span class="sync-label">Network RTT</span><span class="sync-value" id="networkRTT">—</span></div>
     <div class="sync-info"><span class="sync-label">Sync quality</span><span class="sync-value" id="syncQuality">—</span></div>
     <div class="sync-info"><span class="sync-label">Manual offset</span><span class="sync-value" id="deviceOffsetDisplay">0 ms</span></div>
-    <div class="sync-info"><span class="sync-label">HW latency (auto)</span><span class="sync-value" id="hwLatencyDisplay">—</span></div>
-    <div class="sync-info"><span class="sync-label">Measured latency (auto)</span><span class="sync-value" id="measuredLatencyDisplay">—</span></div>
-    <div class="sync-info"><span class="sync-label">Total compensation</span><span class="sync-value" id="totalCompDisplay">—</span></div>
+    <div class="sync-info"><span class="sync-label">HW latency (info only)</span><span class="sync-value" id="hwLatencyDisplay">—</span></div>
+    <div class="sync-info"><span class="sync-label">Pre-compensation</span><span class="sync-value" id="measuredLatencyDisplay">none (rate-sync)</span></div>
+    <div class="sync-info"><span class="sync-label">Total manual offset</span><span class="sync-value" id="totalCompDisplay">—</span></div>
   </div>
 
   <!-- CONNECTED DEVICES CARD -->
@@ -316,12 +316,13 @@ let playbackStartOffset = 0;
 let deviceOffsetMs = 0;
 
 // ─────────────────────────────────────────────────────────────
-// AUTO LATENCY CALIBRATION
-// autoLatencyMs = hardware floor + measured seek+unmute latency.
-// This is subtracted from targetServerTime so the device starts
-// audio output earlier, compensating for its own pipeline delay.
+// LATENCY — v1.6 approach: NO pre-play auto-calibration.
+// All devices aim for the same playAtServerTime (zero pre-comp).
+// Drift is corrected in real-time via playbackRate throttling.
+// Only manual offset (deviceOffsetMs) is applied if user sets it.
+// These vars kept for UI compat / server reporting only.
 // ─────────────────────────────────────────────────────────────
-let autoLatencyMs = 0;
+let autoLatencyMs = 0;   // always 0 now — no pre-compensation
 let autoHwMs = 0;
 let autoMeasuredMs = 0;
 let latencyCalibrated = false;
@@ -361,8 +362,13 @@ let _audioLoadSession = 0;
 let _countdownInterval = null;
 const ownedAudioElements = new Set();
 const PRE_ROLL_MS = 500;
-const INITIAL_SNAP_WINDOW_MS = 1500;
-const INITIAL_SNAP_THRESHOLD = 0.45;
+const INITIAL_SNAP_WINDOW_MS = 2500;   // broader initial correction window
+const INITIAL_SNAP_THRESHOLD = 0.08;   // snap if >80ms drift in first 2.5s
+// Rate-throttle correction: gentle nudge via playbackRate instead of seek
+const DRIFT_RATE_THRESHOLD = 0.04;    // >40ms: start rate correction
+const DRIFT_SNAP_THRESHOLD  = 0.30;   // >300ms: hard seek (severe desync only)
+const RATE_FAST = 1.04;               // catch up 4% faster
+const RATE_SLOW = 0.96;               // slow down 4%
 
 // Seek drag state
 let isSeeking = false;
@@ -753,137 +759,32 @@ function serverTimeNow() {
 // =============================================================
 
 /**
- * Measure the time between pa.currentTime = pos + pa.muted = false
- * and when pa.currentTime actually advances past that position.
- * This simulates what makeAudible() does in schedulePlay.
- * Uses requestAnimationFrame polling for frame-level accuracy.
- */
-async function measurePlaybackLatency() {
-  const pa = window.playerAudio;
-  if (!pa || audioDuration < 2) {
-    dbg('Latency measure skipped: no audio or too short', '#ffaa00');
-    return 0;
-  }
-
-  dbg('Measuring seek+unmute latency (3 samples)...', '#0088ff');
-
-  // Warm-up: start playing muted so audio engine is hot
-  try {
-    pa.currentTime = 1.0;
-    pa.muted = true;
-    pa.volume = 0;
-    const warmPromise = pa.play();
-    if (warmPromise && warmPromise.catch) warmPromise.catch(() => {});
-    await new Promise(r => setTimeout(r, 350)); // allow engine to warm
-  } catch(e) {
-    dbg('Warm-up failed: ' + e.message, '#ffaa00');
-  }
-
-  const samples = [];
-  const maxTestPos = Math.min(audioDuration - 0.5, 4.0);
-
-  for (let i = 0; i < 3; i++) {
-    // Use different positions to avoid caching effects
-    const testPos = clamp(1.0 + i * 0.5, 0.5, maxTestPos);
-
-    try {
-      // Seek while muted (simulates pre-roll state), then unmute
-      pa.currentTime = testPos;
-      const t0 = performance.now();
-      pa.muted = false;
-
-      // Poll with rAF for frame-accurate detection
-      const latencyMs = await new Promise(resolve => {
-        const deadline = t0 + 600; // max 600ms bail-out
-        const check = () => {
-          const now = performance.now();
-          if (now > deadline) {
-            resolve(250); // fallback: assume 250ms on failure
-            return;
-          }
-          // Check if audio has advanced at least 8ms past testPos
-          if (!pa.paused && pa.currentTime > testPos + 0.008) {
-            resolve(now - t0);
-          } else {
-            requestAnimationFrame(check);
-          }
-        };
-        requestAnimationFrame(check);
-      });
-
-      samples.push(latencyMs);
-      dbg('Latency sample ' + (i+1) + ': ' + latencyMs.toFixed(1) + 'ms', '#aaa');
-
-      // Brief gap between samples
-      pa.muted = true;
-      await new Promise(r => setTimeout(r, 100));
-    } catch(e) {
-      dbg('Latency sample error: ' + e.message, '#ffaa00');
-      samples.push(100); // conservative fallback
-    }
-  }
-
-  // Clean up: stop and reset
-  try {
-    pa.pause();
-    pa.muted = false;
-    pa.volume = 1;
-    pa.currentTime = 0;
-  } catch(e) {}
-
-  // Return median of 3 samples
-  samples.sort((a, b) => a - b);
-  const median = samples[1];
-  dbg('Measured latency median: ' + median.toFixed(1) + 'ms (samples: ' + samples.map(s => s.toFixed(0)).join(', ') + ')', '#0088ff');
-  return median;
-}
-
-/**
- * Full calibration: combine AudioContext hardware floor latency
- * with the behavioral seek+unmute measurement. Reports to server.
+ * v1.6: No pre-play behavioral calibration.
+ * We only read AudioContext HW latency for display purposes.
+ * Real-time drift is corrected by startSyncCorrection() via
+ * playbackRate throttling — much more reliable cross-device.
  */
 async function calibrateDeviceLatency() {
   if (calibrationInProgress) return;
   calibrationInProgress = true;
-  setCalStatus('🔬 Calibrating latency...', '');
 
   try {
-    // 1. Hardware latency from AudioContext API (zero-cost, accurate)
     let hwMs = 0;
     if (audioCtx) {
       hwMs = ((audioCtx.baseLatency || 0) + (audioCtx.outputLatency || 0)) * 1000;
-      dbg('HW latency from AudioCtx: ' + hwMs.toFixed(1) + 'ms', '#0088ff');
     }
-
-    // 2. Behavioural: seek+unmute latency measurement
-    const measuredMs = await measurePlaybackLatency();
-
-    // 3. Use the larger of the two (they measure different things)
-    const total = Math.max(hwMs, measuredMs, 0);
-    const capped = Math.min(total, 500); // cap at 500ms sanity ceiling
-
     autoHwMs = hwMs;
-    autoMeasuredMs = measuredMs;
-    autoLatencyMs = capped;
+    autoMeasuredMs = 0;
+    autoLatencyMs = 0;   // NO pre-compensation — sync corrector handles it
     latencyCalibrated = true;
 
-    dbg('Latency calibrated → hw=' + hwMs.toFixed(0) + 'ms measured=' + measuredMs.toFixed(0) + 'ms → using ' + capped.toFixed(0) + 'ms', '#00ff88');
-
-    // Update UI
+    dbg('Latency info (display only): hw=' + hwMs.toFixed(0) + 'ms — real-time rate correction active', '#0088ff');
     updateLatencyUI();
-    setCalStatus('✅ Auto-calibrated: ' + capped.toFixed(0) + 'ms', 'ok');
+    setCalStatus('✅ Rate-sync active (hw ref: ' + hwMs.toFixed(0) + 'ms)', 'ok');
 
-    // Report to server for logging/debugging
-    send({
-      type: 'audio_latency_report',
-      latencyMs: capped,
-      hwMs: hwMs,
-      measuredMs: measuredMs,
-    });
-
+    send({ type: 'audio_latency_report', latencyMs: 0, hwMs, measuredMs: 0 });
   } catch(e) {
-    dbg('Calibration failed: ' + e.message + ' (using 0ms)', '#ffaa00');
-    setCalStatus('⚠️ Calibration failed — manual tune if needed', 'warn');
+    dbg('Latency info error: ' + e.message, '#ffaa00');
   } finally {
     calibrationInProgress = false;
   }
@@ -900,9 +801,9 @@ function updateLatencyUI() {
   const hw = document.getElementById('hwLatencyDisplay');
   const meas = document.getElementById('measuredLatencyDisplay');
   const total = document.getElementById('totalCompDisplay');
-  if (hw) hw.textContent = autoHwMs.toFixed(0) + ' ms';
-  if (meas) meas.textContent = autoMeasuredMs.toFixed(0) + ' ms';
-  if (total) total.textContent = (autoLatencyMs + deviceOffsetMs) + ' ms';
+  if (hw) hw.textContent = autoHwMs > 0 ? autoHwMs.toFixed(0) + ' ms' : '—';
+  if (meas) meas.textContent = 'none (rate-sync)';
+  if (total) total.textContent = deviceOffsetMs + ' ms';
 }
 
 // =============================================================
@@ -1347,18 +1248,17 @@ function getCurrentOffset() {
 }
 
 // =============================================================
-// SCHEDULE PLAY — CLIENT-SIDE LATENCY COMPENSATION
+// SCHEDULE PLAY — v1.6 ZERO PRE-COMPENSATION
 //
-// Server broadcasts ONE playAtServerTime to all devices.
-// Each client subtracts its own autoLatencyMs so it starts
-// audio output early enough that the sound physically exits
-// the speaker at the correct moment.
+// All devices target the SAME playAtServerTime — no pre-comp.
+// Hardware/pipeline latency varies wildly across iOS/Android/
+// Chrome/Safari and cannot be reliably measured from JS.
+// Instead, startSyncCorrection() runs every 500ms after play
+// starts and nudges playbackRate (±4%) to stay locked.
+// Hard seeks only happen for severe desync (>300ms).
 //
-// Formula:
-//   effectiveTarget = playAtServerTime - autoLatencyMs + deviceOffsetMs
-//
-// autoLatencyMs < 0 is clamped to 0 (never delay further).
-// deviceOffsetMs is the manual fine-tune (positive = add delay).
+// deviceOffsetMs = manual user fine-tune (default 0).
+// Positive = add delay (for devices that play too early).
 // =============================================================
 function schedulePlay(playAtServerTime, startOffset) {
   const pa = window.playerAudio;
@@ -1378,19 +1278,9 @@ function schedulePlay(playAtServerTime, startOffset) {
 
   const mySession = _playSession;
 
-  // ─── Core compensation: start early by autoLatencyMs ───────
-  // autoLatencyMs = HW pipeline delay + seek+unmute response time.
-  // We subtract it so the device fires its audio pipeline sooner,
-  // meaning audible output arrives at playAtServerTime.
-  // deviceOffsetMs is a manual trim on top (positive = later).
-  const latencyComp = Math.max(0, autoLatencyMs);       // never negative
-  const effectiveTargetServerTime = playAtServerTime - latencyComp + deviceOffsetMs;
-
-  dbg(
-    'Compensation: auto=' + latencyComp.toFixed(0) + 'ms manual=' + deviceOffsetMs + 'ms' +
-    ' → effective target -' + (latencyComp - deviceOffsetMs).toFixed(0) + 'ms',
-    '#0088ff'
-  );
+  // deviceOffsetMs only: positive = listener delays itself (plays later)
+  // Most users leave this at 0; only needed for Bluetooth headphones etc.
+  const effectiveTargetServerTime = playAtServerTime + deviceOffsetMs;
 
   pauseElement(pa, false, false);
   isPlaying = false;
@@ -1411,7 +1301,7 @@ function schedulePlay(playAtServerTime, startOffset) {
 
   // leadMs is relative to the effective (compensated) target
   const leadMs = effectiveTargetServerTime - serverTimeNow();
-  dbg('leadMs=' + leadMs.toFixed(0) + 'ms startOffset=' + startOffset.toFixed(2) + 's', '#ffaa00');
+  dbg('leadMs=' + leadMs.toFixed(0) + 'ms manualOffset=' + deviceOffsetMs + 'ms startOffset=' + startOffset.toFixed(2) + 's', '#ffaa00');
 
   if (leadMs > 800 && !_suppressNextCountdown) showCountdown(leadMs);
   _suppressNextCountdown = false;
@@ -1434,8 +1324,6 @@ function schedulePlay(playAtServerTime, startOffset) {
 
   function makeAudible() {
     if (failIfStale()) return;
-    // targetOffset uses playAtServerTime (not effectiveTarget) so the
-    // track position is accurate regardless of compensation math
     const targetOffset = expectedOffset();
     try {
       if (pa.paused) {
@@ -1482,12 +1370,14 @@ function schedulePlay(playAtServerTime, startOffset) {
 function startSyncCorrection(pa, sessionId, targetServerTime, startOffset) {
   if (syncCorrector) clearInterval(syncCorrector);
   const correctionStartedAt = Date.now();
-  let lastDriftLog = 0;
   let didInitialSnap = false;
+  let lastDriftLog = 0;
+
   syncCorrector = setInterval(() => {
     if (!isActiveSession(sessionId, pa) || pa.paused || !isPlaying) {
       clearInterval(syncCorrector);
       syncCorrector = null;
+      pa.playbackRate = 1;
       return;
     }
 
@@ -1496,20 +1386,45 @@ function startSyncCorrection(pa, sessionId, targetServerTime, startOffset) {
       0,
       Math.max(0, audioDuration - 0.05)
     );
-    const drift = pa.currentTime - expected;
+    const drift = pa.currentTime - expected; // positive = listener is AHEAD
 
-    if (!didInitialSnap && Date.now() - correctionStartedAt < INITIAL_SNAP_WINDOW_MS && Math.abs(drift) > INITIAL_SNAP_THRESHOLD) {
+    const age = Date.now() - correctionStartedAt;
+
+    // ── Phase 1: Hard snap in first 2.5s if drift > 80ms ──────
+    if (!didInitialSnap && age < INITIAL_SNAP_WINDOW_MS && Math.abs(drift) > INITIAL_SNAP_THRESHOLD) {
       didInitialSnap = true;
-      pa.currentTime = expected;
-      pa.playbackRate = 1;
-      dbg('Initial sync snap ' + Math.round(drift * 1000) + 'ms', '#ffaa00');
-    } else if (Math.abs(drift) > 0.25 && Date.now() - lastDriftLog > 3000) {
-      lastDriftLog = Date.now();
-      dbg('Drift observed ' + Math.round(drift * 1000) + 'ms; not seeking during playback', '#ffaa00');
-    } else if (pa.playbackRate !== 1) {
-      pa.playbackRate = 1;
+      try { pa.currentTime = expected; pa.playbackRate = 1; } catch(e) {}
+      dbg('Initial snap ' + Math.round(drift * 1000) + 'ms → locked', '#ffaa00');
+      return;
     }
-  }, 1000);
+
+    // ── Phase 2: Rate-throttle for gentle ongoing correction ──
+    // This avoids audible glitches that hard-seeks cause.
+    if (Math.abs(drift) > DRIFT_SNAP_THRESHOLD) {
+      // >300ms: something went badly wrong, hard seek
+      try { pa.currentTime = expected; pa.playbackRate = 1; } catch(e) {}
+      if (Date.now() - lastDriftLog > 2000) {
+        lastDriftLog = Date.now();
+        dbg('Hard seek: drift=' + Math.round(drift * 1000) + 'ms', '#ff4444');
+      }
+    } else if (Math.abs(drift) > DRIFT_RATE_THRESHOLD) {
+      // 40ms–300ms: nudge playback rate to converge
+      const rate = drift > 0 ? RATE_SLOW : RATE_FAST; // ahead→slow, behind→fast
+      if (pa.playbackRate !== rate) {
+        try { pa.playbackRate = rate; } catch(e) {}
+        if (Date.now() - lastDriftLog > 2000) {
+          lastDriftLog = Date.now();
+          dbg('Rate nudge ' + (drift > 0 ? 'slow' : 'fast') + ' drift=' + Math.round(drift * 1000) + 'ms', '#0088ff');
+        }
+      }
+    } else {
+      // <40ms: within tolerance, restore normal rate
+      if (pa.playbackRate !== 1) {
+        try { pa.playbackRate = 1; } catch(e) {}
+        dbg('Sync locked (drift=' + Math.round(drift * 1000) + 'ms)', '#00ff88');
+      }
+    }
+  }, 500); // check every 500ms for faster convergence
 }
 
 function stopPlayback(resetPos) {
