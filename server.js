@@ -44,7 +44,7 @@ let audioState = {
   pausedAtOffset: 0,
 };
 
-// ws -> { id, token, name, role, joined, audioActivated, audioReady }
+// ws -> { id, token, name, role, joined, audioActivated, audioReady, audioLatencyMs }
 const clients = new Map();
 let clientIdCounter = 1;
 let hostClientId = null;
@@ -160,6 +160,8 @@ function clientsPayload() {
     role: c.role,
     audioActivated: c.audioActivated,
     audioReady: c.audioReady,
+    // Include latency info for debugging visibility in host UI
+    audioLatencyMs: c.audioLatencyMs !== null ? c.audioLatencyMs : null,
   }));
 }
 
@@ -266,6 +268,7 @@ wss.on('connection', (ws) => {
     joined: false,
     audioActivated: false,
     audioReady: false,
+    audioLatencyMs: null,   // populated by audio_latency_report
   };
 
   clients.set(ws, client);
@@ -333,6 +336,35 @@ wss.on('connection', (ws) => {
         broadcastSession();
         ws.send(JSON.stringify(playbackSnapshot()));
         break;
+
+      // --------------------------------------------------------
+      // NEW: Client reports its own measured audio output latency.
+      // Server stores it for logging/debugging and acks back.
+      // Compensation itself is applied client-side in schedulePlay.
+      // --------------------------------------------------------
+      case 'audio_latency_report': {
+        if (!client.joined) break;
+        const lat = Number(msg.latencyMs);
+        if (Number.isFinite(lat) && lat >= 0 && lat < 2000) {
+          client.audioLatencyMs = Math.round(lat);
+          console.log(
+            'Client ' + client.id + ' (' + client.name + ')' +
+            ' hw=' + (msg.hwMs || 0).toFixed(0) + 'ms' +
+            ' measured=' + (msg.measuredMs || 0).toFixed(0) + 'ms' +
+            ' → using ' + client.audioLatencyMs + 'ms'
+          );
+          // Ack so the client can update its own UI
+          ws.send(JSON.stringify({
+            type: 'latency_ack',
+            latencyMs: client.audioLatencyMs,
+            hwMs: msg.hwMs || 0,
+            measuredMs: msg.measuredMs || 0,
+          }));
+          // Let everyone see updated latency in the device list
+          broadcastSession();
+        }
+        break;
+      }
 
       case 'play':
         if (!isHost(client) || !audioState.buffer) break;
@@ -404,4 +436,4 @@ wss.on('connection', (ws) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('BandSync v1.4 playback-control running on port ' + PORT));
+server.listen(PORT, () => console.log('BandSync v1.5 latency-compensated running on port ' + PORT));
